@@ -24,7 +24,7 @@
     "url": "https://github.com/abelduartek/ByteCode/issues"
   },
   "bin": {
-    "bytecode": "./bin/bytecode.mjs"
+    "bytecode": "bin/bytecode.mjs"
   },
   "files": [
     "bin",
