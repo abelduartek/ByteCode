@@ -1,0 +1,490 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "$id": "https://bytecode.local/bytecode.schema.json",
+  "title": "ByteCode configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "model": {
+      "type": "string",
+      "description": "`provider/model`, e.g. `selbetti/opus`"
+    },
+    "smallModel": {
+      "type": "string",
+      "description": "Cheap model for titles, classification, subagents"
+    },
+    "provider": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "npm": {
+            "type": "string",
+            "description": "npm package implementing the AI SDK provider factory"
+          },
+          "name": {
+            "type": "string"
+          },
+          "env": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Env var names checked for an API key, in order"
+          },
+          "options": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": true
+          },
+          "models": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "Provider-side model id. Defaults to the map key."
+                },
+                "name": {
+                  "type": "string"
+                },
+                "headers": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": {
+                    "type": "string"
+                  }
+                },
+                "limit": {
+                  "type": "object",
+                  "properties": {
+                    "context": {
+                      "type": "number",
+                      "description": "Context window in tokens"
+                    },
+                    "output": {
+                      "type": "number",
+                      "description": "Max output tokens"
+                    }
+                  }
+                },
+                "cost": {
+                  "type": "object",
+                  "properties": {
+                    "input": {
+                      "type": "number",
+                      "description": "USD per 1M input tokens"
+                    },
+                    "output": {
+                      "type": "number",
+                      "description": "USD per 1M output tokens"
+                    }
+                  }
+                },
+                "reasoning": {
+                  "type": "boolean"
+                },
+                "providerOptions": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": true
+                  },
+                  "description": "Passed straight to the AI SDK, keyed by provider slug."
+                }
+              }
+            }
+          }
+        },
+        "required": [
+          "models"
+        ]
+      }
+    },
+    "disabledProviders": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "instructions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Files/globs injected as <system-reminder>"
+    },
+    "assets": {
+      "type": "object",
+      "properties": {
+        "skills": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Directories holding `<name>/SKILL.md`"
+        },
+        "agents": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Directories holding `<name>.md` agent definitions"
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Directories holding `<name>.md` slash commands"
+        }
+      }
+    },
+    "permissions": {
+      "type": "object",
+      "properties": {
+        "allow": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "ask": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "deny": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "defaultMode": {
+          "enum": [
+            "default",
+            "plan",
+            "acceptEdits",
+            "dontAsk",
+            "bypassPermissions"
+          ]
+        }
+      }
+    },
+    "hooks": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "matcher": {
+              "type": "string",
+              "description": "`*`/omitted = all; `A|B` = exact list; anything else = regex"
+            },
+            "hooks": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "const": "command"
+                  },
+                  "command": {
+                    "type": "string"
+                  },
+                  "args": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "if": {
+                    "type": "string",
+                    "description": "Permission-rule filter, e.g. `Bash(git *)`"
+                  },
+                  "timeout": {
+                    "type": "number",
+                    "description": "Seconds"
+                  },
+                  "statusMessage": {
+                    "type": "string"
+                  },
+                  "shell": {
+                    "enum": [
+                      "bash",
+                      "powershell"
+                    ]
+                  }
+                },
+                "required": [
+                  "type",
+                  "command"
+                ]
+              }
+            }
+          },
+          "required": [
+            "hooks"
+          ]
+        }
+      }
+    },
+    "mcp": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "enum": [
+              "local",
+              "remote"
+            ]
+          },
+          "command": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              {
+                "type": "string"
+              }
+            ]
+          },
+          "environment": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "inheritEnv": {
+            "type": "boolean",
+            "description": "Forward this process environment to the server. Default true."
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string",
+            "description": "Remote: endpoint URL"
+          },
+          "headers": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "timeout": {
+            "type": "number",
+            "description": "Seconds for handshake and each tool call. Default 60."
+          },
+          "eager": {
+            "type": "boolean",
+            "description": "Send tool schemas up front instead of deferring them"
+          },
+          "allowedTools": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "parallelSafe": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ],
+            "description": "Let this server tools run concurrently. Without it, only tools declaring readOnlyHint are batched — and that annotation is optional, so most servers set nothing."
+          }
+        }
+      }
+    },
+    "inheritMcp": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "array",
+          "items": {
+            "enum": [
+              "opencode",
+              "claude"
+            ]
+          }
+        }
+      ],
+      "description": "Reuse MCP servers declared by opencode or Claude Code. Off by default."
+    },
+    "compaction": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "threshold": {
+          "type": "number",
+          "description": "Fraction of the context window that triggers compaction"
+        },
+        "keepRecentTurns": {
+          "type": "number"
+        },
+        "model": {
+          "type": "string"
+        },
+        "maxOutputTokens": {
+          "type": "number"
+        }
+      }
+    },
+    "cache": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "ttl": {
+          "enum": [
+            "5m",
+            "1h"
+          ]
+        }
+      }
+    },
+    "workflows": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "maxConcurrency": {
+          "type": "number",
+          "description": "Subagents at once. Defaults to min(8, cores - 2)."
+        },
+        "maxAgents": {
+          "type": "number",
+          "description": "Hard stop for runaway loops. Defaults to 1000."
+        },
+        "tokenBudget": {
+          "type": "number",
+          "description": "Output-token ceiling per run. A hard stop, not a hint."
+        }
+      }
+    },
+    "theme": {
+      "type": "object",
+      "properties": {
+        "preset": {
+          "type": "string",
+          "description": "`terracotta` | `violet` | `azure` | `emerald` | `amber`, or use `tokens`"
+        },
+        "tokens": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": {
+            "type": "number"
+          },
+          "description": "Explicit xterm-256 indices"
+        }
+      }
+    },
+    "ui": {
+      "type": "object",
+      "properties": {
+        "maxWidth": {
+          "type": "number",
+          "description": "0 uses the full terminal width"
+        }
+      }
+    },
+    "deferredTools": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Advertised by name only until ToolSearch loads them"
+    },
+    "disabledTools": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "effort": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    "maxOutputTokens": {
+      "type": "number"
+    },
+    "fileGuard": {
+      "type": "boolean",
+      "description": "Refuse a write that would clobber a file the session never read, or one that changed on disk since it did. On by default."
+    },
+    "maxSteps": {
+      "type": "number",
+      "description": "Model calls one turn may make. Default 64; at 75% the model is told to converge."
+    },
+    "web": {
+      "type": "object",
+      "properties": {
+        "allowPrivateHosts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Hosts WebFetch may reach even though they resolve to a private address"
+        },
+        "maxBytes": {
+          "type": "number",
+          "description": "Body bytes read before the fetch is cut off. Default 2 MiB."
+        }
+      }
+    },
+    "subagentDepth": {
+      "type": "number",
+      "description": "How deep Agent may nest. 0 disables subagents."
+    },
+    "subagentConcurrency": {
+      "type": "number",
+      "description": "Subagents of one step running at once. Defaults to min(8, cpus - 2)."
+    },
+    "dataDir": {
+      "type": "string"
+    },
+    "openCodeAuth": {
+      "type": "boolean",
+      "description": "Read opencode's credential store as a fallback. Off by default."
+    }
+  }
+}

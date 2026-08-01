@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  body { margin: 0; background: #131313; }
+  a { color: #d7875f; }
+  a:hover { color: #e8a077; }
+  @keyframes blink { 0%, 55% { opacity: 1 } 56%, 100% { opacity: 0 } }
+</style>
+</helmet>
+
+<div style="display:flex;flex-direction:column;gap:64px;padding:64px 72px 120px;background:#131313;color:#d0d0d0;font-family:'JetBrains Mono',ui-monospace,monospace;min-height:100vh">
+
+  <div style="max-width:96ch">
+    <div style="font-size:13px;letter-spacing:.18em;text-transform:uppercase;color:#8a8a8a">hx — redesign da TUI</div>
+    <div style="font-size:30px;font-weight:500;color:#f0f0f0;margin-top:14px;line-height:1.3">Terminal, 256 cores, box-drawing.<span style="color:#8a8a8a"> Um passo do que existe hoje para o alvo.</span></div>
+    <div style="font-size:14px;line-height:1.75;color:#9a9a9a;margin-top:18px;text-wrap:pretty">Cada quadro abaixo é uma tela real do <span style="color:#d7875f">fullscreen.ts</span> em 96 colunas. A primeira é a recriação fiel do estado atual (ASCII puro, 16 cores ANSI); as seguintes são o redesenho.</div>
+  </div>
+
+  <!-- ═══════════════ 00 · HOJE ═══════════════ -->
+  <section>
+    <div style="display:flex;align-items:baseline;gap:16px;margin-bottom:16px">
+      <div style="font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:#8a8a8a">00 · hoje</div>
+      <div style="font-size:13px;color:#6e6e6e">estado atual — ASCII puro, 16 cores, box com + - |</div>
+    </div>
+    <div style="width:96ch;background:#000;color:#ccc;font-size:15px;line-height:1.6;border-radius:5px;overflow:hidden;box-shadow:0 20px 44px -14px rgba(0,0,0,.7)">
+      <div style="padding:8px 2ch 10px">
+        <div style="display:flex;justify-content:space-between"><span><b>hx</b> <span style="color:#7f7f7f">selbetti/opus</span></span><span style="color:#7f7f7f">harness main</span></div>
+        <div style="height:1.6em"></div>
+        <div><span style="color:#00cdcd">&gt;</span> <b>por que a compactacao nao cortou nada?</b></div>
+        <div style="height:1.6em"></div>
+        <div><span style="color:#00cd00">ok</span> <b>Read</b> <span style="color:#7f7f7f">src/core/compaction.ts</span></div>
+        <div style="color:#7f7f7f">    318 lines</div>
+        <div><span style="color:#00cd00">ok</span> <b>Grep</b> <span style="color:#7f7f7f">findCutIndex src/**/*.ts</span></div>
+        <div style="color:#7f7f7f">    4 matches</div>
+        <div style="height:1.6em"></div>
+        <div><b>findCutIndex</b> so corta imediatamente antes de um turno <span style="color:#00cdcd">user</span> real. Havia</div>
+        <div>apenas um turno de usuario no historico, logo nao existia ponto seguro de</div>
+        <div>corte e a compactacao foi <b>pulada</b> em vez de orfanar um tool_result.</div>
+        <div style="color:#7f7f7f">----------------------------------------</div>
+        <div style="color:#00cdcd">  reason: "no safe cut point"</div>
+        <div style="color:#7f7f7f">----------------------------------------</div>
+        <div style="height:1.6em"></div>
+        <div style="color:#cdcd00">- ~5659 tokens (47% of 12000), 10 messages</div>
+        <div style="height:1.6em"></div>
+        <div style="color:#7f7f7f;display:flex"><span>+- commands  </span><span style="flex:1;overflow:hidden">-----------------------------------------------------------------------------------</span><span>+</span></div>
+        <div style="color:#7f7f7f;display:flex"><span>|</span><span style="flex:1;padding:0 1ch"><span style="color:#00cdcd">&gt;</span> <span style="color:#ccc">/compact</span> <span style="color:#7f7f7f">summarise history</span></span><span>|</span></div>
+        <div style="color:#7f7f7f;display:flex"><span>|</span><span style="flex:1;padding:0 1ch">  <span style="color:#ccc">/context</span> <span style="color:#7f7f7f">context usage</span></span><span>|</span></div>
+        <div style="color:#7f7f7f;display:flex"><span>|</span><span style="flex:1;padding:0 1ch">  <span style="color:#ccc">/connect</span> <span style="color:#7f7f7f">add an LLM provider</span></span><span>|</span></div>
+        <div style="color:#7f7f7f;display:flex"><span>+</span><span style="flex:1;overflow:hidden">------------------------------------------------------------------------------------------------</span><span>+</span></div>
+        <div style="color:#00cdcd;display:flex"><span>+</span><span style="flex:1;overflow:hidden">------------------------------------------------------------------------------------------------</span><span>+</span></div>
+        <div style="color:#00cdcd;display:flex"><span>|</span><span style="flex:1;padding:0 1ch;color:#ccc"><span style="color:#00cdcd">&gt;</span> /co<span style="color:#7f7f7f">_</span></span><span>|</span></div>
+        <div style="color:#00cdcd;display:flex"><span>+</span><span style="flex:1;overflow:hidden">------------------------------------------------------------------------------------------------</span><span>+</span></div>
+        <div style="display:flex;justify-content:space-between;color:#7f7f7f"><span>ask | ctx 47% | mcp 2</span><span>shift+tab mode  /help</span></div>
+      </div>
+    </div>
+    <div style="width:96ch;font-size:13px;line-height:1.7;color:#7e7e7e;margin-top:14px;text-wrap:pretty">O que quebra a leitura: sem hierarquia entre fala do usuário, prosa do modelo e tool call; a caixa do composer compete com a do popup; o divisor de fence é uma régua de <span style="color:#a0a0a0">-</span>; e as três barras (header, popup, status) têm o mesmo peso.</div>
+  </section>
+
+  <!-- ═══════════════ 01 · SPLASH ═══════════════ -->
+  <section>
+    <div style="display:flex;align-items:baseline;gap:16px;margin-bottom:16px">
+      <div style="font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:#d7875f">01 · splash</div>
+      <div style="font-size:13px;color:#6e6e6e">SessionStart — wordmark, modelo, assets, mcp</div>
+    </div>
+    <div style="width:96ch;background:#262626;color:#d0d0d0;font-size:15px;line-height:1.62;border-radius:6px;overflow:hidden;box-shadow:0 20px 44px -14px rgba(0,0,0,.7)">
+      <div style="display:flex;justify-content:space-between;background:#303030;padding:3px 2ch"><span><span style="color:#d7875f;font-weight:700">hx</span><span style="color:#585858"> ▏</span><span style="color:#87afaf">selbetti/opus</span></span><span style="color:#8a8a8a">harness <span style="color:#585858">▏</span> <span style="color:#af87af">⎇ main</span></span></div>
+      <div style="padding:22px 2ch 10px">
+        <div style="color:#d7875f;font-weight:500">   █  █  ▀▄ ▄▀</div>
+        <div style="color:#d7875f;font-weight:500">   █▀▀█   ▀█▀ <span style="color:#585858">   ▏ </span><span style="color:#8a8a8a;font-weight:400">multi-provider agent harness</span></div>
+        <div style="color:#d7875f;font-weight:500">   █  █  ▄▀ ▀▄ <span style="color:#585858">  ▏ </span><span style="color:#585858;font-weight:400">v0.1 · node 24 · sem build</span></div>
+        <div style="height:1.62em"></div>
+        <div><span style="color:#585858">   model   </span> <span style="color:#87afaf">selbetti/opus</span> <span style="color:#585858">·</span> <span style="color:#8a8a8a">250k ctx · compact em 85%</span></div>
+        <div><span style="color:#585858">   cwd     </span> <span style="color:#d0d0d0">~/dev/harness</span> <span style="color:#585858">·</span> <span style="color:#af87af">⎇ main</span></div>
+        <div><span style="color:#585858">   assets  </span> <span style="color:#d0d0d0">27</span> <span style="color:#8a8a8a">skills</span> <span style="color:#585858">·</span> <span style="color:#d0d0d0">26</span> <span style="color:#8a8a8a">agents</span> <span style="color:#585858">·</span> <span style="color:#d0d0d0">13</span> <span style="color:#8a8a8a">commands</span></div>
+        <div><span style="color:#585858">   mcp     </span> <span style="color:#87af87">●</span> <span style="color:#d0d0d0">azure-devops</span> <span style="color:#8a8a8a">15 tools</span> <span style="color:#585858">·</span> <span style="color:#87af87">●</span> <span style="color:#d0d0d0">everything</span> <span style="color:#8a8a8a">13 tools</span></div>
+        <div style="height:1.62em"></div>
+        <div style="color:#585858">   digite <span style="color:#d7875f">/</span> para comandos · <span style="color:#8a8a8a">shift+tab</span> alterna o modo · <span style="color:#8a8a8a">ctrl+c</span> interrompe</div>
+        <div style="height:2.4em"></div>
+        <div style="display:flex"><span style="color:#4a4a4a">╭</span><span style="flex:1;overflow:hidden;color:#4a4a4a">────────────────────────────────────────────────────────────────────────────────────────────────</span><span style="color:#4a4a4a">╮</span></div>
+        <div style="display:flex"><span style="color:#4a4a4a">│</span><span style="flex:1;padding:0 1ch"><span style="color:#d7875f">❯</span> <span style="color:#585858">pergunte, cole um erro, ou / para comandos</span></span><span style="color:#4a4a4a">│</span></div>
+        <div style="display:flex"><span style="color:#4a4a4a">╰</span><span style="flex:1;overflow:hidden;color:#4a4a4a">────────────────────────────────────────────────────────────────────────────────────────────────</span><span style="color:#4a4a4a">╯</span></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;background:#303030;padding:3px 2ch"><span><span style="color:#8a8a8a">ask</span><span style="color:#585858"> ▏ </span><span style="color:#8a8a8a">ctx</span> <span style="color:#87af87">0%</span><span style="color:#585858"> ▏ </span><span style="color:#8a8a8a">mcp 2</span></span><span style="color:#585858">shift+tab mode · /help</span></div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 02 · SESSÃO ═══════════════ -->
+  <section>
+    <div style="display:flex;align-items:baseline;gap:16px;margin-bottom:16px">
+      <div style="font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:#d7875f">02 · sessão</div>
+      <div style="font-size:13px;color:#6e6e6e">turno completo — rail do usuário, prosa, tool calls colapsadas, streaming</div>
+    </div>
+    <div style="width:96ch;background:#262626;color:#d0d0d0;font-size:15px;line-height:1.62;border-radius:6px;overflow:hidden;box-shadow:0 20px 44px -14px rgba(0,0,0,.7)">
+      <div style="display:flex;justify-content:space-between;background:#303030;padding:3px 2ch"><span><span style="color:#d7875f;font-weight:700">hx</span><span style="color:#585858"> ▏</span><span style="color:#87afaf">selbetti/opus</span></span><span style="color:#8a8a8a">harness <span style="color:#585858">▏</span> <span style="color:#af87af">⎇ main</span></span></div>
+      <div style="padding:12px 2ch">
+        <div style="display:flex"><span style="color:#d7875f">▌ </span><span style="color:#f0f0f0;font-weight:500">por que a compactação não cortou nada quando estourou o threshold?</span></div>
+        <div style="height:1.62em"></div>
+        <div style="color:#8a8a8a"><span style="color:#87afaf">⠿</span> pensando <span style="color:#585858">· 4s</span></div>
+        <div style="height:1.62em"></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="color:#87af87">✔</span> <span style="color:#d0d0d0;font-weight:500">Read</span> <span style="color:#8a8a8a">src/core/compaction.ts</span> <span style="color:#585858">318 linhas</span></span><span style="color:#585858">⌄ ctrl+r</span></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="color:#87af87">✔</span> <span style="color:#d0d0d0;font-weight:500">Grep</span> <span style="color:#8a8a8a">findCutIndex</span> <span style="color:#585858">src/**/*.ts · 4 hits</span></span><span style="color:#585858">⌄ ctrl+r</span></div>
+        <div style="height:1.62em"></div>
+        <div style="text-wrap:pretty">A compactação rodou, mas <span style="color:#87afaf">findCutIndex</span> devolveu <span style="color:#87afaf">-1</span>. O corte só pode acontecer</div>
+        <div>imediatamente antes de um turno <span style="color:#d0d0d0;font-weight:500">user</span> real — cortar no meio de um round-trip de tool</div>
+        <div>deixaria um <span style="color:#87afaf">tool_result</span> órfão e o provider rejeita o request inteiro.</div>
+        <div style="height:1.62em"></div>
+        <div><span style="color:#585858">▏</span> Como só havia <span style="color:#d0d0d0;font-weight:500">um</span> turno de usuário no histórico, não existia ponto seguro.</div>
+        <div><span style="color:#585858">▏</span> O harness seguiu sem compactar e reportou <span style="color:#87afaf">skipped</span> — comportamento correto.</div>
+        <div style="height:1.62em"></div>
+        <div style="display:flex"><span style="color:#3f3f3f">╭─ </span><span style="color:#585858">compaction.ts:212</span><span style="flex:1;overflow:hidden;color:#3f3f3f"> ──────────────────────────────────────────────────────────────────────</span><span style="color:#3f3f3f">╮</span></div>
+        <div style="display:flex"><span style="color:#3f3f3f">│ </span><span style="flex:1;color:#87afaf">if (cut &lt; 0) return { compacted: <span style="color:#d7af5f">false</span>, reason: <span style="color:#87af87">'no safe cut point'</span> }</span><span style="color:#3f3f3f">│</span></div>
+        <div style="display:flex"><span style="color:#3f3f3f">╰</span><span style="flex:1;overflow:hidden;color:#3f3f3f">────────────────────────────────────────────────────────────────────────────────────────────────</span><span style="color:#3f3f3f">╯</span></div>
+        <div style="height:1.62em"></div>
+        <div><span style="color:#87afaf">⠹</span> <span style="color:#d0d0d0;font-weight:500">Edit</span> <span style="color:#8a8a8a">src/core/compaction.ts</span> <span style="color:#585858">+3 −1</span></div>
+        <div style="height:1.62em"></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:#d7af5f">▲ compactação pulada — nenhum ponto de corte seguro</span><span style="color:#585858">1 aviso</span></div>
+        <div style="height:1.62em"></div>
+        <div style="display:flex"><span style="color:#d7875f">╭</span><span style="flex:1;overflow:hidden;color:#d7875f">────────────────────────────────────────────────────────────────────────────────────────────────</span><span style="color:#d7875f">╮</span></div>
+        <div style="display:flex"><span style="color:#d7875f">│</span><span style="flex:1;padding:0 1ch"><span style="color:#87afaf">⠙</span> <span style="color:#d0d0d0">aplicando o patch e rodando a suíte</span><span style="color:#d7875f;animation:blink 1.1s steps(1) infinite">▉</span></span><span style="color:#d7875f">│</span></div>
+        <div style="display:flex"><span style="color:#d7875f">╰</span><span style="flex:1;overflow:hidden;color:#d7875f">────────────────────────────────────────────────────────────────────────────────────────────────</span><span style="color:#d7875f">╯</span></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;background:#303030;padding:3px 2ch"><span><span style="color:#8a8a8a">ask</span><span style="color:#585858"> ▏ </span><span style="color:#8a8a8a">ctx</span> <span style="color:#d7af5f">47%</span> <span style="color:#585858">▁▂▃▄▅▂▁</span><span style="color:#585858"> ▏ </span><span style="color:#8a8a8a">mcp 2</span></span><span><span style="color:#d7af5f">4.1k in / 862 out</span><span style="color:#585858"> ▏ esc interrompe</span></span></div>
+    </div>
+    <div style="width:96ch;display:grid;grid-template-columns:repeat(3,1fr);gap:22px;margin-top:16px;font-size:13px;line-height:1.7;color:#7e7e7e">
+      <div><span style="color:#d7875f">▌ rail</span> — só a fala do usuário ganha barra de acento; o resto do turno é prosa sem marcador.</div>
+      <div><span style="color:#87af87">✔ uma linha</span> — tool call colapsada com contagem no fim; <span style="color:#a0a0a0">ctrl+r</span> expande a preview.</div>
+      <div><span style="color:#d7af5f">▲ aviso</span> — notice e error viram glifo triangular, nunca <span style="color:#a0a0a0">-</span> ou <span style="color:#a0a0a0">x</span>.</div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 03 · COMPOSER + POPUP ═══════════════ -->
+  <section>
+    <div style="display:flex;align-items:baseline;gap:16px;margin-bottom:16px">
+      <div style="font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:#d7875f">03 · composer</div>
+      <div style="font-size:13px;color:#6e6e6e">popup de comandos: sem borda própria, ancorado no composer</div>
+    </div>
+    <div style="width:96ch;background:#262626;color:#d0d0d0;font-size:15px;line-height:1.62;border-radius:6px;overflow:hidden;box-shadow:0 20px 44px -14px rgba(0,0,0,.7)">
+      <div style="padding:12px 2ch 0;color:#585858">
+        <div>… <span style="color:#3f3f3f">histórico acima</span></div>
+      </div>
+      <div style="padding:10px 2ch 12px">
+        <div style="display:flex;justify-content:space-between"><span style="color:#585858">  comandos <span style="color:#3f3f3f">·</span> 6 de 31</span><span style="color:#3f3f3f">↑↓ move · tab completa · enter roda</span></div>
+        <div style="display:flex;justify-content:space-between;background:#333"><span><span style="color:#d7875f">❯ </span><span style="color:#f0f0f0;font-weight:500">/compact</span> <span style="color:#8a8a8a">[foco]</span></span><span style="color:#8a8a8a">resume o histórico agora</span></div>
+        <div style="display:flex;justify-content:space-between"><span>  <span style="color:#d0d0d0">/connect</span></span><span style="color:#585858">adiciona um provider de LLM</span></div>
+        <div style="display:flex;justify-content:space-between"><span>  <span style="color:#d0d0d0">/context</span></span><span style="color:#585858">uso da janela de contexto</span></div>
+        <div style="display:flex;justify-content:space-between"><span>  <span style="color:#d0d0d0">/commands</span></span><span style="color:#585858">arquivos de comando</span></div>
+        <div style="display:flex;justify-content:space-between"><span>  <span style="color:#d0d0d0">/cobranca-triage</span></span><span style="color:#585858">command file</span></div>
+        <div style="display:flex;justify-content:space-between"><span>  <span style="color:#d0d0d0">/changelog</span></span><span style="color:#585858">command file</span></div>
+        <div style="height:.6em"></div>
+        <div style="display:flex"><span style="color:#d7875f">╭</span><span style="flex:1;overflow:hidden;color:#d7875f">────────────────────────────────────────────────────────────────────────────────────────────────</span><span style="color:#d7875f">╮</span></div>
+        <div style="display:flex"><span style="color:#d7875f">│</span><span style="flex:1;padding:0 1ch"><span style="color:#d7875f">❯</span> <span style="color:#f0f0f0">/co</span><span style="color:#d7875f;animation:blink 1.1s steps(1) infinite">▉</span></span><span style="color:#d7875f">│</span></div>
+        <div style="display:flex"><span style="color:#d7875f">╰</span><span style="flex:1;overflow:hidden;color:#d7875f">────────────────────────────────────────────────────────────────────────────────────────────────</span><span style="color:#d7875f">╯</span></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;background:#303030;padding:3px 2ch"><span><span style="color:#8a8a8a">ask</span><span style="color:#585858"> ▏ </span><span style="color:#8a8a8a">ctx</span> <span style="color:#d7af5f">47%</span><span style="color:#585858"> ▏ </span><span style="color:#8a8a8a">mcp 2</span></span><span style="color:#585858">shift+tab mode · /help</span></div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 04 · PERMISSÃO ═══════════════ -->
+  <section>
+    <div style="display:flex;align-items:baseline;gap:16px;margin-bottom:16px">
+      <div style="font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:#d7875f">04 · permissão</div>
+      <div style="font-size:13px;color:#6e6e6e">modal centrado, chat esmaecido atrás, comando destacado</div>
+    </div>
+    <div style="width:96ch;background:#262626;color:#d0d0d0;font-size:15px;line-height:1.62;border-radius:6px;overflow:hidden;box-shadow:0 20px 44px -14px rgba(0,0,0,.7)">
+      <div style="display:flex;justify-content:space-between;background:#303030;padding:3px 2ch"><span><span style="color:#d7875f;font-weight:700">hx</span><span style="color:#585858"> ▏</span><span style="color:#87afaf">selbetti/opus</span></span><span style="color:#8a8a8a">harness <span style="color:#585858">▏</span> <span style="color:#af87af">⎇ main</span></span></div>
+      <div style="padding:12px 2ch">
+        <div style="color:#3f3f3f">▌ rodar a suíte de compactação</div>
+        <div style="color:#3f3f3f">✔ Read src/core/compaction.ts</div>
+        <div style="height:1.62em"></div>
+        <div style="padding:0 8ch">
+          <div style="display:flex"><span style="color:#d7af5f">╭─ </span><span style="color:#d7af5f;font-weight:500">permissão</span><span style="flex:1;overflow:hidden;color:#d7af5f"> ──────────────────────────────────────────────────────</span><span style="color:#d7af5f">╮</span></div>
+          <div style="display:flex"><span style="color:#d7af5f">│</span><span style="flex:1;padding:0 1ch"> <span style="color:#f0f0f0;font-weight:500">Bash</span> <span style="color:#8a8a8a">executa um comando no shell</span></span><span style="color:#d7af5f">│</span></div>
+          <div style="display:flex"><span style="color:#d7af5f">│</span><span style="flex:1;padding:0 1ch"> </span><span style="color:#d7af5f">│</span></div>
+          <div style="display:flex"><span style="color:#d7af5f">│</span><span style="flex:1;padding:0 1ch;background:#2f2f2f"> <span style="color:#87af87">$</span> <span style="color:#d0d0d0">node --test src/core/compaction.test.ts</span></span><span style="color:#d7af5f">│</span></div>
+          <div style="display:flex"><span style="color:#d7af5f">│</span><span style="flex:1;padding:0 1ch"> <span style="color:#585858">cwd ~/dev/harness · regra <span style="color:#8a8a8a">Bash(*)</span> → ask</span></span><span style="color:#d7af5f">│</span></div>
+          <div style="display:flex"><span style="color:#d7af5f">│</span><span style="flex:1;padding:0 1ch"> </span><span style="color:#d7af5f">│</span></div>
+          <div style="display:flex"><span style="color:#d7af5f">│</span><span style="flex:1;padding:0 1ch"> <span style="color:#87af87">y</span> <span style="color:#d0d0d0">permitir uma vez</span>   <span style="color:#87af87">a</span> <span style="color:#d0d0d0">permitir Bash na sessão</span>   <span style="color:#d75f5f">n</span> <span style="color:#d0d0d0">negar</span></span><span style="color:#d7af5f">│</span></div>
+          <div style="display:flex"><span style="color:#d7af5f">│</span><span style="flex:1;padding:0 1ch"> <span style="color:#585858">cansado de perguntas? esc, depois shift+tab 2× para <span style="color:#d75f5f">AUTO</span></span></span><span style="color:#d7af5f">│</span></div>
+          <div style="display:flex"><span style="color:#d7af5f">╰</span><span style="flex:1;overflow:hidden;color:#d7af5f">────────────────────────────────────────────────────────────────────────</span><span style="color:#d7af5f">╯</span></div>
+        </div>
+      </div>
+      <div style="display:flex;justify-content:space-between;background:#303030;padding:3px 2ch"><span><span style="color:#8a8a8a">ask</span><span style="color:#585858"> ▏ </span><span style="color:#8a8a8a">ctx</span> <span style="color:#d7af5f">47%</span><span style="color:#585858"> ▏ </span><span style="color:#8a8a8a">mcp 2</span></span><span style="color:#d7af5f">aguardando permissão</span></div>
+    </div>
+    <div style="width:96ch;font-size:13px;line-height:1.7;color:#7e7e7e;margin-top:14px">O acento do modal carrega o significado: <span style="color:#d7af5f">âmbar</span> pede decisão, <span style="color:#87afaf">teal</span> é escolha neutra (picker/input), <span style="color:#d75f5f">vermelho</span> só aparece em AUTO e em deny.</div>
+  </section>
+
+  <!-- ═══════════════ 05 · PICKER + INPUT ═══════════════ -->
+  <section>
+    <div style="display:flex;align-items:baseline;gap:16px;margin-bottom:16px">
+      <div style="font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:#d7875f">05 · /connect</div>
+      <div style="font-size:13px;color:#6e6e6e">picker dos 174 providers → chave mascarada → baseURL</div>
+    </div>
+    <div style="display:flex;gap:24px;flex-wrap:wrap">
+      <div style="width:78ch;background:#262626;color:#d0d0d0;font-size:15px;line-height:1.62;border-radius:6px;overflow:hidden;box-shadow:0 20px 44px -14px rgba(0,0,0,.7);padding:14px 2ch">
+        <div style="display:flex"><span style="color:#87afaf">╭─ </span><span style="color:#87afaf;font-weight:500">connect provider</span><span style="flex:1;overflow:hidden;color:#87afaf"> ─────────────────────────────────────────────</span><span style="color:#87afaf">╮</span></div>
+        <div style="display:flex"><span style="color:#87afaf">│</span><span style="flex:1;padding:0 1ch"><span style="color:#585858">filtro</span> <span style="color:#f0f0f0">gro</span><span style="color:#87afaf;animation:blink 1.1s steps(1) infinite">▉</span></span><span style="color:#585858">3 de 174</span><span style="color:#87afaf">│</span></div>
+        <div style="display:flex"><span style="color:#87afaf">│</span><span style="flex:1;padding:0 1ch"> </span><span style="color:#87afaf">│</span></div>
+        <div style="display:flex"><span style="color:#87afaf">│</span><span style="flex:1;padding:0 1ch;background:#333;display:flex;justify-content:space-between"><span><span style="color:#87afaf">❯ </span><span style="color:#f0f0f0;font-weight:500">groq</span></span><span style="color:#8a8a8a">Groq · 18 models</span></span><span style="color:#87afaf">│</span></div>
+        <div style="display:flex"><span style="color:#87afaf">│</span><span style="flex:1;padding:0 1ch;display:flex;justify-content:space-between"><span>  <span style="color:#d0d0d0">groq-cloud</span></span><span style="color:#585858">Groq Cloud · 12 models</span></span><span style="color:#87afaf">│</span></div>
+        <div style="display:flex"><span style="color:#87afaf">│</span><span style="flex:1;padding:0 1ch;display:flex;justify-content:space-between"><span>  <span style="color:#d0d0d0">togetherai</span></span><span style="color:#585858">Together · 87 models</span></span><span style="color:#87afaf">│</span></div>
+        <div style="display:flex"><span style="color:#87afaf">│</span><span style="flex:1;padding:0 1ch"> </span><span style="color:#87afaf">│</span></div>
+        <div style="display:flex"><span style="color:#87afaf">│</span><span style="flex:1;padding:0 1ch;color:#585858">↑↓ move · digite para filtrar · enter seleciona · esc cancela</span><span style="color:#87afaf">│</span></div>
+        <div style="display:flex"><span style="color:#87afaf">╰</span><span style="flex:1;overflow:hidden;color:#87afaf">───────────────────────────────────────────────────────────────────────────</span><span style="color:#87afaf">╯</span></div>
+        <div style="height:1.62em"></div>
+        <div style="display:flex"><span style="color:#87afaf">╭─ </span><span style="color:#87afaf;font-weight:500">connect groq</span><span style="flex:1;overflow:hidden;color:#87afaf"> ─────────────────────────────────────────────────</span><span style="color:#87afaf">╮</span></div>
+        <div style="display:flex"><span style="color:#87afaf">│</span><span style="flex:1;padding:0 1ch;color:#8a8a8a">API key <span style="color:#585858">· GROQ_API_KEY · https://api.groq.com/openai/v1</span></span><span style="color:#87afaf">│</span></div>
+        <div style="display:flex"><span style="color:#87afaf">│</span><span style="flex:1;padding:0 1ch"> </span><span style="color:#87afaf">│</span></div>
+        <div style="display:flex"><span style="color:#87afaf">│</span><span style="flex:1;padding:0 1ch"><span style="color:#87afaf">❯</span> <span style="color:#d0d0d0">•••••••••••••••••••••••••</span><span style="color:#87afaf;animation:blink 1.1s steps(1) infinite">▉</span></span><span style="color:#87afaf">│</span></div>
+        <div style="display:flex"><span style="color:#87afaf">│</span><span style="flex:1;padding:0 1ch"> </span><span style="color:#87afaf">│</span></div>
+        <div style="display:flex"><span style="color:#87afaf">│</span><span style="flex:1;padding:0 1ch;color:#585858">grava em ~/.hx/auth.json (chmod 600) · enter confirma · esc cancela</span><span style="color:#87afaf">│</span></div>
+        <div style="display:flex"><span style="color:#87afaf">╰</span><span style="flex:1;overflow:hidden;color:#87afaf">───────────────────────────────────────────────────────────────────────────</span><span style="color:#87afaf">╯</span></div>
+      </div>
+      <div style="width:78ch;background:#262626;color:#d0d0d0;font-size:15px;line-height:1.62;border-radius:6px;overflow:hidden;box-shadow:0 20px 44px -14px rgba(0,0,0,.7);padding:14px 2ch">
+        <div style="color:#585858">após o enter:</div>
+        <div style="height:1.62em"></div>
+        <div style="display:flex"><span style="color:#87afaf">╭─ </span><span style="color:#87afaf;font-weight:500">connect</span><span style="flex:1;overflow:hidden;color:#87afaf"> ──────────────────────────────────────────────────────</span><span style="color:#87afaf">╮</span></div>
+        <div style="display:flex"><span style="color:#87afaf">│</span><span style="flex:1;padding:0 1ch"><span style="color:#87afaf">⠸</span> <span style="color:#d0d0d0">baixando catálogo de providers…</span></span><span style="color:#87afaf">│</span></div>
+        <div style="display:flex"><span style="color:#87afaf">╰</span><span style="flex:1;overflow:hidden;color:#87afaf">───────────────────────────────────────────────────────────────────────────</span><span style="color:#87afaf">╯</span></div>
+        <div style="height:1.62em"></div>
+        <div><span style="color:#87af87">●</span> <span style="color:#f0f0f0;font-weight:500">groq conectado</span> <span style="color:#585858">· gsk_…f31a em ~/.hx/auth.json</span></div>
+        <div style="height:1.62em"></div>
+        <div><span style="color:#585858">  ▏ </span><span style="color:#87afaf">groq/llama-3.3-70b-versatile</span> <span style="color:#585858">128k</span></div>
+        <div><span style="color:#585858">  ▏ </span><span style="color:#87afaf">groq/llama-3.1-8b-instant</span> <span style="color:#585858">128k</span></div>
+        <div><span style="color:#585858">  ▏ </span><span style="color:#87afaf">groq/qwen-2.5-32b</span> <span style="color:#585858">32k</span></div>
+        <div style="height:1.62em"></div>
+        <div style="color:#8a8a8a">  use <span style="color:#d0d0d0">/model</span> para trocar. <span style="color:#585858">nenhuma edição de config foi necessária.</span></div>
+        <div style="height:1.62em"></div>
+        <div><span style="color:#d7af5f">▲</span> <span style="color:#d7af5f">pacote AI SDK ausente</span> <span style="color:#585858">— <span style="color:#8a8a8a">npm i @ai-sdk/groq</span></span></div>
+        <div style="height:1.62em"></div>
+        <div><span style="color:#d75f5f">✕</span> <span style="color:#d75f5f">401 do provider</span> <span style="color:#585858">— chave rejeitada, credencial não foi gravada</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 06 · DIFF ═══════════════ -->
+  <section>
+    <div style="display:flex;align-items:baseline;gap:16px;margin-bottom:16px">
+      <div style="font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:#d7875f">06 · diff</div>
+      <div style="font-size:13px;color:#6e6e6e">Edit/Write expandido — lado a lado quando cabem 96 colunas, unificado abaixo disso</div>
+    </div>
+    <div style="width:96ch;background:#262626;color:#d0d0d0;font-size:15px;line-height:1.62;border-radius:6px;overflow:hidden;box-shadow:0 20px 44px -14px rgba(0,0,0,.7);padding:12px 2ch">
+      <div style="display:flex;justify-content:space-between"><span><span style="color:#87af87">✔</span> <span style="color:#f0f0f0;font-weight:500">Edit</span> <span style="color:#8a8a8a">src/core/compaction.ts</span> <span style="color:#87af87">+3</span> <span style="color:#d75f5f">−1</span></span><span style="color:#585858">⌃ ctrl+r colapsa</span></div>
+      <div style="height:.5em"></div>
+      <div style="display:flex"><span style="color:#3f3f3f">╭</span><span style="flex:1;overflow:hidden;color:#3f3f3f">──────────────────────────────────────────</span><span style="color:#3f3f3f">┬</span><span style="flex:1;overflow:hidden;color:#3f3f3f">──────────────────────────────────────────</span><span style="color:#3f3f3f">╮</span></div>
+      <div style="display:flex"><span style="color:#3f3f3f">│</span><span style="flex:1;padding:0 1ch;color:#585858">antes</span><span style="color:#3f3f3f">│</span><span style="flex:1;padding:0 1ch;color:#585858">depois</span><span style="color:#3f3f3f">│</span></div>
+      <div style="display:flex"><span style="color:#3f3f3f">│</span><span style="flex:1;padding:0 1ch"><span style="color:#4a4a4a">209 </span><span style="color:#8a8a8a">const cut = findCutIndex(msgs, keep)</span></span><span style="color:#3f3f3f">│</span><span style="flex:1;padding:0 1ch"><span style="color:#4a4a4a">209 </span><span style="color:#8a8a8a">const cut = findCutIndex(msgs, keep)</span></span><span style="color:#3f3f3f">│</span></div>
+      <div style="display:flex"><span style="color:#3f3f3f">│</span><span style="flex:1;padding:0 1ch;background:#3a2a2a"><span style="color:#4a4a4a">210 </span><span style="color:#d75f5f">− if (cut &lt; 0) return skip()</span></span><span style="color:#3f3f3f">│</span><span style="flex:1;padding:0 1ch;background:#2a352a"><span style="color:#4a4a4a">210 </span><span style="color:#87af87">+ if (cut &lt; 0) {</span></span><span style="color:#3f3f3f">│</span></div>
+      <div style="display:flex"><span style="color:#3f3f3f">│</span><span style="flex:1;padding:0 1ch"><span style="color:#4a4a4a">    </span></span><span style="color:#3f3f3f">│</span><span style="flex:1;padding:0 1ch;background:#2a352a"><span style="color:#4a4a4a">211 </span><span style="color:#87af87">+   log.skip('no safe cut point')</span></span><span style="color:#3f3f3f">│</span></div>
+      <div style="display:flex"><span style="color:#3f3f3f">│</span><span style="flex:1;padding:0 1ch"><span style="color:#4a4a4a">    </span></span><span style="color:#3f3f3f">│</span><span style="flex:1;padding:0 1ch;background:#2a352a"><span style="color:#4a4a4a">212 </span><span style="color:#87af87">+   return skip('no safe cut point')</span></span><span style="color:#3f3f3f">│</span></div>
+      <div style="display:flex"><span style="color:#3f3f3f">│</span><span style="flex:1;padding:0 1ch"><span style="color:#4a4a4a">    </span></span><span style="color:#3f3f3f">│</span><span style="flex:1;padding:0 1ch;background:#2a352a"><span style="color:#4a4a4a">213 </span><span style="color:#87af87">+ }</span></span><span style="color:#3f3f3f">│</span></div>
+      <div style="display:flex"><span style="color:#3f3f3f">│</span><span style="flex:1;padding:0 1ch"><span style="color:#4a4a4a">211 </span><span style="color:#8a8a8a">const summary = await summarise(…)</span></span><span style="color:#3f3f3f">│</span><span style="flex:1;padding:0 1ch"><span style="color:#4a4a4a">214 </span><span style="color:#8a8a8a">const summary = await summarise(…)</span></span><span style="color:#3f3f3f">│</span></div>
+      <div style="display:flex"><span style="color:#3f3f3f">╰</span><span style="flex:1;overflow:hidden;color:#3f3f3f">──────────────────────────────────────────</span><span style="color:#3f3f3f">┴</span><span style="flex:1;overflow:hidden;color:#3f3f3f">──────────────────────────────────────────</span><span style="color:#3f3f3f">╯</span></div>
+      <div style="height:1.62em"></div>
+      <div style="color:#585858">estreito (&lt; 80 colunas) → unificado, mesma paleta:</div>
+      <div style="display:flex"><span style="color:#3f3f3f">│ </span><span style="color:#af87af">@@ -209,3 +209,6 @@ export async function compact(</span></div>
+      <div style="display:flex"><span style="color:#3f3f3f">│ </span><span style="color:#d75f5f;background:#3a2a2a">− if (cut &lt; 0) return skip()</span></div>
+      <div style="display:flex"><span style="color:#3f3f3f">│ </span><span style="color:#87af87;background:#2a352a">+ if (cut &lt; 0) {</span></div>
+      <div style="display:flex"><span style="color:#3f3f3f">│ </span><span style="color:#87af87;background:#2a352a">+   return skip('no safe cut point')</span></div>
+      <div style="display:flex"><span style="color:#3f3f3f">│ </span><span style="color:#87af87;background:#2a352a">+ }</span></div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 07 · LISTAS ═══════════════ -->
+  <section>
+    <div style="display:flex;align-items:baseline;gap:16px;margin-bottom:16px">
+      <div style="font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:#d7875f">07 · listas &amp; /help</div>
+      <div style="font-size:13px;color:#6e6e6e">/help, /skills, /tools, /mcp, /context — saídas de comando como blocos assistant</div>
+    </div>
+    <div style="display:flex;gap:24px;flex-wrap:wrap">
+      <div style="width:60ch;background:#262626;font-size:15px;line-height:1.62;border-radius:6px;box-shadow:0 20px 44px -14px rgba(0,0,0,.7);padding:14px 2ch">
+        <div style="color:#d7875f;font-weight:500">teclas</div>
+        <div><span style="color:#585858">  ▏ </span><span style="color:#87afaf">/</span> <span style="color:#8a8a8a">abre a lista · enter roda o destacado</span></div>
+        <div><span style="color:#585858">  ▏ </span><span style="color:#87afaf">shift+tab</span> <span style="color:#8a8a8a">alterna o modo de permissão</span></div>
+        <div><span style="color:#585858">  ▏ </span><span style="color:#87afaf">ctrl+r</span> <span style="color:#8a8a8a">expande/colapsa a última tool</span></div>
+        <div><span style="color:#585858">  ▏ </span><span style="color:#87afaf">pgup/pgdn</span> <span style="color:#8a8a8a">rola · esc limpa o composer</span></div>
+        <div><span style="color:#585858">  ▏ </span><span style="color:#87afaf">ctrl+c</span> <span style="color:#8a8a8a">interrompe · 2× no vazio sai</span></div>
+        <div style="height:1.62em"></div>
+        <div style="color:#d7875f;font-weight:500">modos de permissão</div>
+        <div style="display:flex;justify-content:space-between"><span><span style="color:#585858">  ▏ </span><span style="color:#8a8a8a">ask</span></span><span style="color:#585858">pergunta antes de escrever ou rodar</span></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="color:#585858">  ▏ </span><span style="color:#87afaf">plan</span></span><span style="color:#585858">só leitura</span></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="color:#585858">  ▏ </span><span style="color:#d7af5f">auto-edit</span></span><span style="color:#585858">edita, comandos ainda perguntam</span></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="color:#585858">  ▏ </span><span style="color:#8a8a8a">no-ask</span></span><span style="color:#585858">o que perguntaria é negado</span></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="color:#585858">  ▏ </span><span style="color:#d75f5f;font-weight:700">AUTO</span></span><span style="color:#585858">roda sem perguntar</span></div>
+        <div style="height:1.62em"></div>
+        <div style="color:#8a8a8a;text-wrap:pretty">  Regras <span style="color:#d75f5f">deny</span> valem em <span style="color:#f0f0f0">todos</span> os modos, AUTO incluído.</div>
+      </div>
+      <div style="width:60ch;background:#262626;font-size:15px;line-height:1.62;border-radius:6px;box-shadow:0 20px 44px -14px rgba(0,0,0,.7);padding:14px 2ch">
+        <div style="display:flex;justify-content:space-between"><span style="color:#d7875f;font-weight:500">tools</span><span style="color:#585858">/tools</span></div>
+        <div><span style="color:#585858">  ativas  </span><span style="color:#87af87">●</span> <span style="color:#d0d0d0">Read Write Edit LS Glob Grep Bash</span></div>
+        <div><span style="color:#585858">  deferred</span> <span style="color:#585858">○</span> <span style="color:#8a8a8a">PowerShell · mcp__azure-devops__* (15)</span></div>
+        <div><span style="color:#585858">          </span> <span style="color:#585858">○</span> <span style="color:#8a8a8a">mcp__everything__* (13)</span></div>
+        <div style="height:1.62em"></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:#d7875f;font-weight:500">mcp</span><span style="color:#585858">/mcp</span></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="color:#87af87">  ●</span> <span style="color:#d0d0d0">azure-devops</span> <span style="color:#585858">stdio</span></span><span style="color:#8a8a8a">15 tools · 2 resources</span></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="color:#87af87">  ●</span> <span style="color:#d0d0d0">everything</span> <span style="color:#585858">stdio</span></span><span style="color:#8a8a8a">13 tools</span></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="color:#d75f5f">  ●</span> <span style="color:#d0d0d0">algum-remoto</span> <span style="color:#585858">http</span></span><span style="color:#d75f5f">ECONNREFUSED</span></div>
+        <div style="height:1.62em"></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:#d7875f;font-weight:500">skills</span><span style="color:#585858">/skills · 27</span></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="color:#585858">  ▏ </span><span style="color:#d0d0d0">pdf-forms</span></span><span style="color:#585858">preenche formulários PDF</span></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="color:#585858">  ▏ </span><span style="color:#d0d0d0">cobranca-flow</span></span><span style="color:#585858">fluxo de cobrança Selbetti</span></div>
+        <div style="color:#585858">  ▏ <span style="color:#3f3f3f">… 25 mais · pgdn</span></div>
+        <div style="height:1.62em"></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:#d7875f;font-weight:500">context</span><span style="color:#585858">/context</span></div>
+        <div style="color:#8a8a8a">  <span style="color:#87af87">████████</span><span style="color:#d7af5f">███</span><span style="color:#3f3f3f">██████████</span> <span style="color:#d0d0d0">47%</span> <span style="color:#585858">5.6k / 12k · 10 msgs</span></div>
+        <div style="color:#585858">  system 1.3k · bootstrap 25k · turnos 4</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 08 · COMPACTAÇÃO ═══════════════ -->
+  <section>
+    <div style="display:flex;align-items:baseline;gap:16px;margin-bottom:16px">
+      <div style="font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:#d7875f">08 · compactação</div>
+      <div style="font-size:13px;color:#6e6e6e">divisor de corte no transcript — o único elemento full-width do chat</div>
+    </div>
+    <div style="width:96ch;background:#262626;color:#d0d0d0;font-size:15px;line-height:1.62;border-radius:6px;overflow:hidden;box-shadow:0 20px 44px -14px rgba(0,0,0,.7);padding:12px 2ch">
+      <div style="color:#3f3f3f">▌ … 6 turnos anteriores</div>
+      <div style="height:1.62em"></div>
+      <div style="display:flex"><span style="color:#af87af">─── </span><span style="color:#af87af;font-weight:500">contexto compactado</span><span style="color:#585858">&nbsp; 5.659 → 371 tokens · 10 → 5 msgs&nbsp;</span><span style="flex:1;overflow:hidden;color:#af87af">────────────────────────────────</span></div>
+      <div style="height:1.62em"></div>
+      <div><span style="color:#585858">▏ </span><span style="color:#8a8a8a">Resumo preserva: decisão de não usar o MCP do Azure DevOps (PAT</span></div>
+      <div><span style="color:#585858">▏ </span><span style="color:#8a8a8a">comprometido), o corte seguro em findCutIndex e a suíte de 29 asserções.</span></div>
+      <div style="height:1.62em"></div>
+      <div style="display:flex"><span style="color:#585858">╌╌╌ </span><span style="color:#585858">turnos mantidos na íntegra (4)</span><span style="flex:1;overflow:hidden;color:#2f2f2f">&nbsp;╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌</span></div>
+      <div style="height:1.62em"></div>
+      <div style="display:flex"><span style="color:#d7875f">▌ </span><span style="color:#f0f0f0;font-weight:500">continua: roda a suíte de novo</span></div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 09 · --simple + NO_COLOR ═══════════════ -->
+  <section>
+    <div style="display:flex;align-items:baseline;gap:16px;margin-bottom:16px">
+      <div style="font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:#d7875f">09 · degradação</div>
+      <div style="font-size:13px;color:#6e6e6e">--simple (UI de linha, sem alt-screen) e NO_COLOR / TERM=dumb</div>
+    </div>
+    <div style="display:flex;gap:24px;flex-wrap:wrap">
+      <div style="width:60ch;background:#262626;color:#d0d0d0;font-size:15px;line-height:1.62;border-radius:6px;box-shadow:0 20px 44px -14px rgba(0,0,0,.7);padding:14px 2ch">
+        <div style="color:#585858">--simple · sem barras, sem viewport</div>
+        <div style="height:1.62em"></div>
+        <div><span style="color:#d7875f">hx</span> <span style="color:#585858">selbetti/opus · ask · /help</span></div>
+        <div style="height:1.62em"></div>
+        <div><span style="color:#d7875f">❯</span> <span style="color:#f0f0f0">rode os testes de compactação</span></div>
+        <div><span style="color:#87af87">✔</span> <span style="color:#d0d0d0">Bash</span> <span style="color:#8a8a8a">node --test compaction.test.ts</span></div>
+        <div style="color:#585858">  29 pass, 0 fail</div>
+        <div>Todas as 29 asserções passam.</div>
+        <div><span style="color:#d7875f">❯</span> <span style="color:#585858">▉</span></div>
+      </div>
+      <div style="width:60ch;background:#1c1c1c;color:#c8c8c8;font-size:15px;line-height:1.62;border-radius:6px;box-shadow:0 20px 44px -14px rgba(0,0,0,.7);padding:14px 2ch">
+        <div style="color:#8a8a8a">NO_COLOR=1 · box-drawing mantido, peso por glifo</div>
+        <div style="height:1.62em"></div>
+        <div style="display:flex;justify-content:space-between"><span><b>hx</b> selbetti/opus</span><span>harness ⎇ main</span></div>
+        <div style="height:1.62em"></div>
+        <div>▌ <b>rode os testes de compactação</b></div>
+        <div style="display:flex;justify-content:space-between"><span>✔ <b>Bash</b> node --test compaction.test.ts</span><span>⌄ ctrl+r</span></div>
+        <div>Todas as <b>29</b> asserções passam.</div>
+        <div>▲ 1 aviso · compactação pulada</div>
+        <div style="height:1.62em"></div>
+        <div style="display:flex"><span>╭</span><span style="flex:1;overflow:hidden">──────────────────────────────────────────────────────────</span><span>╮</span></div>
+        <div style="display:flex"><span>│</span><span style="flex:1;padding:0 1ch">❯ ▉</span><span>│</span></div>
+        <div style="display:flex"><span>╰</span><span style="flex:1;overflow:hidden">──────────────────────────────────────────────────────────</span><span>╯</span></div>
+        <div style="display:flex;justify-content:space-between"><span>ask ▏ ctx 47%</span><span>shift+tab mode</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 10 · SPEC ═══════════════ -->
+  <section>
+    <div style="display:flex;align-items:baseline;gap:16px;margin-bottom:16px">
+      <div style="font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:#d7875f">10 · spec</div>
+      <div style="font-size:13px;color:#6e6e6e">tokens para o ansi.ts — índices xterm-256 e fallback 16</div>
+    </div>
+    <div style="width:96ch;display:grid;grid-template-columns:1fr 1fr;gap:24px">
+      <div style="background:#1c1c1c;border:1px solid #2f2f2f;border-radius:6px;padding:16px 2ch;font-size:14px;line-height:1.9">
+        <div style="display:flex;justify-content:space-between;color:#585858;font-size:12px;letter-spacing:.1em;text-transform:uppercase;margin-bottom:8px"><span>token</span><span>256 · hex · fallback 16</span></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="display:inline-block;width:1.6ch;height:1em;background:#262626;border:1px solid #3f3f3f;vertical-align:-2px"></span> <span style="color:#d0d0d0">bg</span></span><span style="color:#585858">235 · #262626 · <span style="color:#8a8a8a">default</span></span></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="display:inline-block;width:1.6ch;height:1em;background:#303030;vertical-align:-2px"></span> <span style="color:#d0d0d0">bar</span></span><span style="color:#585858">236 · #303030 · <span style="color:#8a8a8a">reverse</span></span></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="display:inline-block;width:1.6ch;height:1em;background:#d0d0d0;vertical-align:-2px"></span> <span style="color:#d0d0d0">fg</span></span><span style="color:#585858">252 · #d0d0d0 · <span style="color:#8a8a8a">default</span></span></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="display:inline-block;width:1.6ch;height:1em;background:#8a8a8a;vertical-align:-2px"></span> <span style="color:#d0d0d0">dim</span></span><span style="color:#585858">245 · #8a8a8a · <span style="color:#8a8a8a">dim</span></span></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="display:inline-block;width:1.6ch;height:1em;background:#585858;vertical-align:-2px"></span> <span style="color:#d0d0d0">faint</span></span><span style="color:#585858">240 · #585858 · <span style="color:#8a8a8a">gray</span></span></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="display:inline-block;width:1.6ch;height:1em;background:#d7875f;vertical-align:-2px"></span> <span style="color:#d0d0d0">accent</span></span><span style="color:#585858">173 · #d7875f · <span style="color:#8a8a8a">yellow</span></span></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="display:inline-block;width:1.6ch;height:1em;background:#87afaf;vertical-align:-2px"></span> <span style="color:#d0d0d0">info</span></span><span style="color:#585858">109 · #87afaf · <span style="color:#8a8a8a">cyan</span></span></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="display:inline-block;width:1.6ch;height:1em;background:#87af87;vertical-align:-2px"></span> <span style="color:#d0d0d0">ok</span></span><span style="color:#585858">108 · #87af87 · <span style="color:#8a8a8a">green</span></span></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="display:inline-block;width:1.6ch;height:1em;background:#d7af5f;vertical-align:-2px"></span> <span style="color:#d0d0d0">warn</span></span><span style="color:#585858">179 · #d7af5f · <span style="color:#8a8a8a">yellow</span></span></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="display:inline-block;width:1.6ch;height:1em;background:#d75f5f;vertical-align:-2px"></span> <span style="color:#d0d0d0">danger</span></span><span style="color:#585858">167 · #d75f5f · <span style="color:#8a8a8a">red</span></span></div>
+        <div style="display:flex;justify-content:space-between"><span><span style="display:inline-block;width:1.6ch;height:1em;background:#af87af;vertical-align:-2px"></span> <span style="color:#d0d0d0">meta</span></span><span style="color:#585858">139 · #af87af · <span style="color:#8a8a8a">magenta</span></span></div>
+      </div>
+      <div style="background:#1c1c1c;border:1px solid #2f2f2f;border-radius:6px;padding:16px 2ch;font-size:14px;line-height:1.9">
+        <div style="color:#585858;font-size:12px;letter-spacing:.1em;text-transform:uppercase;margin-bottom:8px">glifos</div>
+        <div><span style="color:#8a8a8a">box</span> <span style="color:#d0d0d0">╭ ─ ╮ │ ╰ ╯ ┬ ┴</span> <span style="color:#585858">· sub-régua ╌ · rail ▌ ▏</span></div>
+        <div><span style="color:#8a8a8a">estado</span> <span style="color:#87af87">✔</span> <span style="color:#d75f5f">✕</span> <span style="color:#d7af5f">▲</span> <span style="color:#87af87">●</span> <span style="color:#585858">○</span> <span style="color:#af87af">─</span></div>
+        <div><span style="color:#8a8a8a">prompt</span> <span style="color:#d7875f">❯</span> <span style="color:#585858">· expandir ⌄ ⌃ · git ⎇ · cursor ▉</span></div>
+        <div><span style="color:#8a8a8a">spinner</span> <span style="color:#87afaf">⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏</span></div>
+        <div><span style="color:#8a8a8a">sparkline</span> <span style="color:#585858">▁ ▂ ▃ ▄ ▅ ▆ ▇ █</span> <span style="color:#3f3f3f">· uso de contexto</span></div>
+        <div style="height:1em"></div>
+        <div style="color:#585858;font-size:12px;letter-spacing:.1em;text-transform:uppercase;margin:10px 0 8px">regras de layout</div>
+        <div style="color:#8a8a8a;line-height:1.75;text-wrap:pretty">Coluna centrada, teto de <span style="color:#d0d0d0">120</span> colunas · header e status são as únicas linhas com background · uma linha em branco entre blocos, nunca duas · tool call ocupa <span style="color:#d0d0d0">1</span> linha até o <span style="color:#d0d0d0">ctrl+r</span> · modal centrado com no máx. <span style="color:#d0d0d0">78</span> colunas, borda colorida pelo tipo de decisão · texto informativo à direita sempre <span style="color:#d0d0d0">faint</span>.</div>
+        <div style="height:1em"></div>
+        <div style="color:#585858;font-size:12px;letter-spacing:.1em;text-transform:uppercase;margin:10px 0 8px">degradação</div>
+        <div style="color:#8a8a8a;line-height:1.75;text-wrap:pretty">256 → 16 pela coluna de fallback · <span style="color:#d0d0d0">NO_COLOR</span>/<span style="color:#d0d0d0">TERM=dumb</span> mantém glifos e usa bold/dim · <span style="color:#d0d0d0">HX_ASCII=1</span> troca box-drawing por <span style="color:#d0d0d0">+-|</span> e braille por <span style="color:#d0d0d0">|/-\</span>.</div>
+      </div>
+    </div>
+  </section>
+
+</div>
+</x-dc>
+</body>
+</html>

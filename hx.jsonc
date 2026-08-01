@@ -1,0 +1,254 @@
+{
+  "$schema": "./bytecode.schema.json",
+  "model": "selbetti/sonnet",
+  "theme": { "preset": "violet" },
+  "ui": { "maxWidth": 0 },
+  "compaction": {
+    "enabled": true,
+    "threshold": 0.85,
+    "keepRecentTurns": 4
+  },
+  "mcp": {
+    // Sem bloco "environment": o servidor herda o ambiente do processo, igual ao
+    // opencode (`MCP.connectLocal` faz `env: {...process.env, ...environment}`), e
+    // pega o PERSONAL_ACCESS_TOKEN que já existe como variável de usuário. É o que
+    // faz esta config funcionar sem nenhum passo extra em máquina que já usava
+    // opencode.
+    //
+    // @azure-devops/mcp 2.7.0 com "-a pat" lê PERSONAL_ACCESS_TOKEN e usa o valor
+    // direto como credencial Basic, então ele precisa ser base64 de ":" + PAT.
+    // "ADO_PAT" é um nome que esta versão nunca lê — era a causa do
+    // "Connection closed". Em máquina sem a variável, declare explicitamente:
+    //   "environment": { "PERSONAL_ACCESS_TOKEN": "{base64::{file:~/.bytecode/ado-pat}}" }
+    // (arquivo com o PAT cru, fora do repositório; o {base64::...} monta a credencial)
+    "azure-devops": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "npx",
+        "-y",
+        "@azure-devops/mcp",
+        "selbettidev",
+        "--authentication",
+        "pat",
+        "-d",
+        "core",
+        "work",
+        "work-items"
+      ]
+    },
+    "everything": {
+      "type": "local",
+      "enabled": false,
+      "command": ["npx", "-y", "@modelcontextprotocol/server-everything"]
+    }
+  },
+  "provider": {
+    "anthropic": {
+      "npm": "@ai-sdk/anthropic",
+      "name": "Anthropic",
+      "env": [
+        "ANTHROPIC_API_KEY"
+      ],
+      "models": {
+        "opus": {
+          "id": "claude-opus-5",
+          "name": "Claude Opus 5",
+          "limit": {
+            "context": 1000000,
+            "output": 64000
+          }
+        },
+        "sonnet": {
+          "id": "claude-sonnet-5",
+          "name": "Claude Sonnet 5",
+          "limit": {
+            "context": 1000000,
+            "output": 64000
+          }
+        }
+      }
+    },
+    "selbetti": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Selbetti",
+      "env": [
+        "SELBETTI_API_KEY"
+      ],
+      "options": {
+        "baseURL": "https://vllm-oracle.selbetti.tech/v1"
+      },
+      "models": {
+        "sonnet": {
+          "id": "claude-sonnet-4-6",
+          "name": "Claude Sonnet 4.6",
+          "headers": {
+            "x-litellm-tags": "opencode,cobranca_team"
+          },
+          "limit": {
+            "context": 124000,
+            "output": 16384
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          }
+        },
+        "opus": {
+          "id": "claude-opus-4-7",
+          "name": "Claude Opus 4.7",
+          "headers": {
+            "x-litellm-tags": "opencode,cobranca_team"
+          },
+          "limit": {
+            "context": 250000,
+            "output": 16384
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          }
+        },
+        "sonne5": {
+          "id": "claude-sonnet-5",
+          "name": "Claude Sonnet 5",
+          "headers": {
+            "x-litellm-tags": "opencode,cobranca_team"
+          },
+          "limit": {
+            "context": 250000,
+            "output": 16384
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          }
+        }
+      }
+    },
+    "selbetti-free": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Selbetti-Free",
+      "options": {
+        "baseURL": "https://vllm-oracle.selbetti.tech/v1"
+      },
+      "models": {
+        "qwen36": {
+          "id": "Qwen/Qwen3.6-35B-A3B-FP8",
+          "name": "Qwen3.6 35B A3B FP8",
+          "headers": {
+            "x-litellm-tags": "opencode,cobranca_team"
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 124000,
+            "output": 16384
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          }
+        },
+        "kimi-k2.6": {
+          "id": "kimi-k2.6",
+          "name": "kimi-k2.6",
+          "headers": {
+            "x-litellm-tags": "opencode,cobranca_team"
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 124000,
+            "output": 16384
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          }
+        },
+        "kimi-k2.7-code": {
+          "id": "kimi-k2.7-code",
+          "name": "kimi-k2.7 code",
+          "headers": {
+            "x-litellm-tags": "opencode,cobranca_team"
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 124000,
+            "output": 16384
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          }
+        }
+      }
+    },
+    "9router": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "9router",
+      "env": ["ROUTER_API_KEY"],
+      "options": {
+        "baseURL": "https://9router.iasandbox.dev/v1"
+      },
+      "models": {
+        "sonnet5": {
+          "id": "cc/claude-sonnet-5",
+          "name": "Claude Sonnet 5",
+          "limit": {
+            "context": 1000000,
+            "output": 116384
+          },
+          "cost": {
+            "input": 2,
+            "output": 10
+          }
+        }
+      }
+    }
+  },
+  "permissions": {
+    "allow": [
+      "Read(**)",
+      "Glob(**)",
+      "Grep(**)",
+      "LS(**)"
+    ],
+    "ask": [
+      "Write(**)",
+      "Edit(**)",
+      "Bash(*)",
+      "PowerShell(*)"
+    ],
+    "deny": [
+      "Read(**/.env)",
+      "Read(**/*.pem)",
+      "Bash(rm -rf:*)"
+    ],
+    "defaultMode": "default"
+  },
+  "subagentDepth": 1
+}

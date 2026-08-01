@@ -1,0 +1,34 @@
+{
+  "name": "bytecode",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ByteCode — multi-provider agent harness with Claude Code semantics and an opencode-style provider layer",
+  "bin": {
+    "bytecode": "./bin/bytecode.mjs",
+    "bc": "./bin/bytecode.mjs"
+  },
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "bytecode": "node --experimental-strip-types src/index.ts",
+    "bun:bytecode": "bun src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node test/run.mjs",
+    "check": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^4.0.23",
+    "@ai-sdk/openai-compatible": "^3.0.16",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "ai": "^7.0.41"
+  },
+  "optionalDependencies": {
+    "@vscode/ripgrep": "^1.15.14"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}

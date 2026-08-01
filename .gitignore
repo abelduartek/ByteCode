@@ -1,0 +1,11 @@
+node_modules/
+
+# State directories, current and pre-rename. These hold auth.json and sessions.
+.bytecode/
+.hx/
+
+# Local overrides and anything that could carry a credential.
+bytecode.local.jsonc
+hx.local.jsonc
+*.local.json
+auth.json
