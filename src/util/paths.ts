@@ -11,7 +11,7 @@ import path from 'node:path'
 
 export const CLI = 'bytecode'
 export const LEGACY_CLI = 'hx'
-export const VERSION = '1.0.0'
+export const VERSION = '1.0.1'
 
 const HOME_DIR = `.${CLI}`
 const LEGACY_HOME_DIR = `.${LEGACY_CLI}`

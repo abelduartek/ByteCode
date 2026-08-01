@@ -4100,8 +4100,58 @@ export async function runFullscreenTui(
     })
   }
 
+  /**
+   * Enquanto a tela alternativa é nossa, ninguém mais escreve nela.
+   *
+   * O quadro é desenhado por diferença: cada linha é posicionada com
+   * `CSI <linha>;1H` e só as que mudaram são reescritas. Qualquer texto que
+   * apareça por fora disso — um `DeprecationWarning` do Node, um `console.warn`
+   * de biblioteca, o aviso de um provider — empurra o conteúdo e deixa o
+   * diferencial acreditando que sabe o que está na tela. O sintoma é o que se vê
+   * na captura: linhas duplicadas, composer repetido, barra de status no meio da
+   * conversa.
+   *
+   * Então o stderr é desviado para dentro do transcript, onde ele é conteúdo em
+   * vez de sujeira. Repetidos são contados, não empilhados: um aviso emitido a
+   * cada chamada ao modelo viraria uma parede de linhas iguais.
+   */
+  function captureStderr(): () => void {
+    const original = process.stderr.write.bind(process.stderr)
+    let ultimo = ''
+    let repetidos = 0
+
+    process.stderr.write = ((chunk: unknown, ...rest: unknown[]): boolean => {
+      const texto = typeof chunk === 'string' ? chunk : String(chunk)
+      const limpo = texto.replace(/\s+/g, ' ').trim()
+      if (!limpo) return true
+
+      if (limpo === ultimo) {
+        repetidos++
+        // O bloco já está na tela; só o contador muda.
+        const anterior = blocks[blocks.length - 1]
+        if (anterior?.kind === 'notice') {
+          anterior.text = `${ultimo} (${repetidos + 1}×)`
+          dirty = true
+          return true
+        }
+      }
+      ultimo = limpo
+      repetidos = 0
+      push({ kind: 'notice', text: limpo })
+      scheduleDraw()
+      return true
+      // A assinatura de `write` tem três formas; nenhuma delas é usada aqui além
+      // do texto, e o retorno `true` diz "coube no buffer".
+    }) as typeof process.stderr.write
+
+    return () => {
+      process.stderr.write = original
+    }
+  }
+
   // --------------------------------------------------------------- lifecycle
 
+  const releaseStderr = captureStderr()
   out.write(ALT_ON + CURSOR_HIDE + MOUSE_ON + PASTE_ON + CLEAR_SCREEN)
   process.stdin.setRawMode?.(true)
   process.stdin.resume()
@@ -4235,6 +4285,7 @@ export async function runFullscreenTui(
     process.stdin.setRawMode?.(false)
     process.stdin.pause()
     out.write(PASTE_OFF + MOUSE_OFF + CURSOR_SHOW + ALT_OFF)
+    releaseStderr()
     await session.transcript.flush()
   }
 

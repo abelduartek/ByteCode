@@ -1071,6 +1071,29 @@ log('--- alt+v anexa imagem do clipboard ---')
   clip.setFakeClipboardImage(null)
 }
 
+// Um aviso do Node ou de biblioteca escrito no stderr enquanto a tela
+// alternativa é nossa embaralha o quadro: o desenho é por diferença, e texto que
+// aparece por fora dele empurra as linhas sem que o diferencial saiba. Tem de
+// virar conteúdo do transcript, não sujeira na tela.
+log('--- stderr de terceiros não escapa para a tela ---')
+{
+  const antes = screen.join('\n')
+  process.stderr.write('DeprecationWarning: alguma biblioteca reclamando\n')
+  await tick(200)
+  check('o aviso vira bloco no transcript', has('alguma biblioteca reclamando'),
+    JSON.stringify(lines().slice(-4)))
+  check('e o quadro continua desenhado', screen.join('\n') !== antes, '')
+
+  // Repetido não empilha: um aviso emitido a cada chamada ao modelo viraria uma
+  // parede de linhas iguais.
+  process.stderr.write('DeprecationWarning: alguma biblioteca reclamando\n')
+  process.stderr.write('DeprecationWarning: alguma biblioteca reclamando\n')
+  await tick(200)
+  const ocorrencias = lines().filter(l => l.includes('alguma biblioteca reclamando')).length
+  check('repetido é contado, não empilhado', ocorrencias === 1, String(ocorrencias))
+  check('e mostra a contagem', has('3×'), JSON.stringify(lines().slice(-3)))
+}
+
 log('--- 08 · divisor de compactacao ---')
 session.emit({ type: 'notice', text: 'compacted: ~5659 -> ~371 tokens' })
 await tick(150)

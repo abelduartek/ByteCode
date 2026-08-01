@@ -144,9 +144,12 @@ export async function runTurn(
       ? promptText
       : [
           { type: 'text', text: promptText },
+          // `file`, não `image`: o AI SDK v7 depreciou a parte `image`, e a
+          // depreciação é anunciada com um aviso do Node no stderr — que, com a
+          // TUI dona da tela alternativa, é impresso por cima do quadro.
           ...images.map(image => ({
-            type: 'image',
-            image: image.data,
+            type: 'file',
+            data: image.data,
             mediaType: image.mediaType,
           })),
         ]
