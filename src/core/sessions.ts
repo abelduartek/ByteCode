@@ -26,6 +26,13 @@ export type SessionState = {
   modelRef: string
   messages: ModelMessage[]
   tokenBaseline?: TokenBaseline
+  /**
+   * Session this one was forked from. Absent on a session started normally,
+   * which is what makes it a root — `main` in the tree.
+   */
+  parentId?: string
+  /** Messages copied from the parent at fork time, for "forked at turn N". */
+  forkedAtMessage?: number
 }
 
 export type SessionMeta = {
@@ -37,12 +44,77 @@ export type SessionMeta = {
   updatedAt: string
   turns: number
   messages: number
+  parentId?: string
+  forkedAtMessage?: number
 }
 
 export type SessionSummary = SessionMeta & {
   /** First 8 characters of the id — what `/resume` and the picker accept. */
   short: string
   updated: number
+}
+
+/** A session plus its forks, recursively — what the tree view walks. */
+export type SessionNode = SessionSummary & {
+  children: SessionNode[]
+  /** 0 for a root; one more than the parent for each level below. */
+  depth: number
+}
+
+/**
+ * Sessions arranged as forests of forks, newest root first.
+ *
+ * A session whose parent is missing (deleted, or in another project) is treated
+ * as a root rather than dropped: losing the parent must not hide the work.
+ */
+export function sessionTree(sessions: SessionSummary[]): SessionNode[] {
+  const nodes = new Map<string, SessionNode>()
+  for (const s of sessions) nodes.set(s.id, { ...s, children: [], depth: 0 })
+
+  const roots: SessionNode[] = []
+  for (const node of nodes.values()) {
+    const parent = node.parentId ? nodes.get(node.parentId) : undefined
+    if (parent && parent !== node) parent.children.push(node)
+    else roots.push(node)
+  }
+
+  // A cycle would make the walk below never terminate. It should be impossible —
+  // a fork's parent always predates it — but a hand-edited meta file is enough,
+  // and hanging the UI is a worse answer than showing the session as a root.
+  const seen = new Set<string>()
+  const assign = (node: SessionNode, depth: number): void => {
+    if (seen.has(node.id)) {
+      node.children = []
+      return
+    }
+    seen.add(node.id)
+    node.depth = depth
+    node.children.sort((a, b) => a.updated - b.updated)
+    for (const child of node.children) assign(child, depth + 1)
+  }
+  for (const root of roots) assign(root, 0)
+
+  // Um ciclo deixa nós sem raiz alguma, e o resultado seria a sessão sumir da
+  // lista — pior do que mostrá-la no lugar errado. Quem sobrou vira raiz.
+  for (const node of nodes.values()) {
+    if (seen.has(node.id)) continue
+    node.children = []
+    roots.push(node)
+    assign(node, 0)
+  }
+
+  return roots.sort((a, b) => b.updated - a.updated)
+}
+
+/** Depth-first flattening: the order the tree is drawn and navigated in. */
+export function flattenTree(roots: SessionNode[]): SessionNode[] {
+  const out: SessionNode[] = []
+  const walk = (node: SessionNode) => {
+    out.push(node)
+    for (const child of node.children) walk(child)
+  }
+  for (const root of roots) walk(root)
+  return out
 }
 
 /** Where sessions are written. */
@@ -100,6 +172,22 @@ export function countTurns(messages: ModelMessage[]): number {
   return messages.filter(m => m.role === 'user').length
 }
 
+/**
+ * Image bytes are dropped from the snapshot.
+ *
+ * A resumed session is a transcript to read, not a prompt to replay byte for
+ * byte, and keeping them would rewrite a multi-megabyte file on every single
+ * turn — the image survives as its marker in the text, which is what the
+ * conversation actually refers to.
+ */
+function dropImageBytes(key: string, value: unknown): unknown {
+  if (key !== 'image' && key !== 'data') return value
+  if (typeof value === 'string' || value instanceof Uint8Array || Array.isArray(value)) {
+    return undefined
+  }
+  return value
+}
+
 /** Writes to a temp file and renames, so a crash cannot leave half a snapshot. */
 async function writeAtomic(file: string, body: string): Promise<void> {
   await ensureDir(path.dirname(file))
@@ -135,9 +223,19 @@ export async function saveSessionState(
     updatedAt: now,
     turns: countTurns(state.messages),
     messages: state.messages.length,
+    // Carried into the meta so the tree can be built from the small files alone:
+    // reading every state snapshot just to draw a list would be the one thing
+    // the split into two files exists to avoid.
+    ...(state.parentId ? { parentId: state.parentId } : {}),
+    ...(state.forkedAtMessage !== undefined
+      ? { forkedAtMessage: state.forkedAtMessage }
+      : {}),
   }
 
-  await writeAtomic(stateFile(config, state.cwd, state.id), JSON.stringify(state))
+  await writeAtomic(
+    stateFile(config, state.cwd, state.id),
+    JSON.stringify(state, dropImageBytes),
+  )
   await writeAtomic(metaFile(config, state.cwd, state.id), JSON.stringify(meta, null, 2))
 }
 
@@ -192,10 +290,39 @@ export async function listSessions(config: Config, cwd: string): Promise<Session
  * nothing matches; throws only when a prefix matches more than one session.
  */
 /** Reads a state file from whichever directory has it, current location first. */
+/**
+ * Rebuilds a message list that is safe to send again.
+ *
+ * The bytes of an image were dropped on save, so what comes back is a part with
+ * no image in it — which a provider rejects outright. The part is replaced by
+ * the text marker it stood for, so a resumed session still reads correctly and
+ * still sends.
+ */
+function restoreMessages(messages: SessionState['messages']): SessionState['messages'] {
+  return messages.map(message => {
+    if (!Array.isArray(message.content)) return message
+    const parts = message.content as { type: string; image?: unknown; mediaType?: string }[]
+    if (!parts.some(part => part.type === 'image' && !hasImageData(part.image))) return message
+
+    const rebuilt = parts.map(part =>
+      part.type === 'image' && !hasImageData(part.image)
+        ? { type: 'text', text: '[imagem enviada antes, nao guardada na sessao]' }
+        : part,
+    )
+    return { ...message, content: rebuilt } as typeof message
+  })
+}
+
+function hasImageData(image: unknown): boolean {
+  if (typeof image === 'string') return image.length > 0
+  if (image instanceof Uint8Array || Array.isArray(image)) return true
+  return false
+}
+
 async function readState(config: Config, cwd: string, id: string): Promise<SessionState | null> {
   for (const dir of projectDirs(config, cwd)) {
     const found = await readJson<SessionState>(path.join(dir, `${id}.state.json`))
-    if (found?.messages) return found
+    if (found?.messages) return { ...found, messages: restoreMessages(found.messages) }
   }
   return null
 }

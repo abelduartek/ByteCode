@@ -221,6 +221,10 @@ export function diffLines(before: string[], after: string[]): LineOp[] {
  * grouped or side by side, with line numbers on both sides.
  */
 export function unifiedDiff(change: FileChange, label: string): string {
+  const byLabel = diffMemo.get(change)
+  const cached = byLabel?.get(label)
+  if (cached !== undefined) return cached
+
   const before = change.before === null ? [] : change.before.split('\n')
   const after = change.after.split('\n')
   const ops = diffLines(before, after)
@@ -281,14 +285,37 @@ export function unifiedDiff(change: FileChange, label: string): string {
     for (const op of hunk) out.push(`${op.marker}${op.text}`)
   }
 
-  return out.join('\n')
+  const text = out.join('\n')
+  const store = byLabel ?? new Map<string, string>()
+  store.set(label, text)
+  diffMemo.set(change, store)
+  return text
 }
+
+/**
+ * Memo for the two functions that run the LCS.
+ *
+ * Both are called from the TUI's frame builder, once per changed file, and the
+ * frame is rebuilt on every blink and every streamed chunk — so a session with
+ * a handful of edited files re-ran an O(before × after) dynamic program several
+ * times a second, for a result that only changes when a file is written.
+ *
+ * Keyed on the change object, which `recordChange` replaces on every write: a
+ * new write is a new object, so the entry cannot go stale.
+ */
+const statsMemo = new WeakMap<FileChange, { added: number; removed: number }>()
+const diffMemo = new WeakMap<FileChange, Map<string, string>>()
 
 /** `+12 -3`, the counter the file list shows next to each name. */
 export function changeStats(change: FileChange): { added: number; removed: number } {
+  const cached = statsMemo.get(change)
+  if (cached) return cached
+
   const ops = diffLines(change.before === null ? [] : change.before.split('\n'), change.after.split('\n'))
-  return {
+  const stats = {
     added: ops.filter(op => op.marker === '+').length,
     removed: ops.filter(op => op.marker === '-').length,
   }
+  statsMemo.set(change, stats)
+  return stats
 }

@@ -189,6 +189,18 @@ export function configSchema(): Record<string, unknown> {
       deferredTools: { ...strings, description: 'Advertised by name only until ToolSearch loads them' },
       disabledTools: strings,
       effort: { enum: ['low', 'medium', 'high', 'xhigh', 'max'] },
+      reasoning: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          inlineThinkTags: {
+            ...bool,
+            description:
+              'Whether the provider streams reasoning as literal <think> tags inside the content. ' +
+              'Guessed from the provider package when unset.',
+          },
+        },
+      },
       maxOutputTokens: num,
       fileGuard: {
         ...bool,

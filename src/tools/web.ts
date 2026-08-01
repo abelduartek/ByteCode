@@ -1,4 +1,6 @@
 import { promises as dns } from 'node:dns'
+import http from 'node:http'
+import https from 'node:https'
 import { isIP } from 'node:net'
 import type { ToolDefinition } from '../core/tools.ts'
 
@@ -104,18 +106,135 @@ export async function assertPublicHost(url: URL, opts: WebGuardOptions = {}): Pr
   }
 }
 
+/** What this file needs from a response — the subset `fetch` also gives. */
+export type GuardedResponse = {
+  status: number
+  ok: boolean
+  headers: { get: (name: string) => string | null }
+  body: (AsyncIterable<Uint8Array> & { cancel: () => Promise<void> }) | null
+}
+
 export type FetchOutcome = {
-  response: Response
+  response: GuardedResponse
   finalUrl: string
   hops: number
 }
 
 /**
+ * The address a host resolves to, refusing anything that is not public.
+ *
+ * Returned rather than merely checked, because the check is only worth as much
+ * as the connection that follows it: see `requestPinned`.
+ */
+async function resolveGuarded(url: URL, opts: WebGuardOptions): Promise<{ address: string; family: number }> {
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error(`only http and https are allowed, got "${url.protocol}"`)
+  }
+  const host = url.hostname.replace(/^\[|\]$/g, '')
+  const allowed = (opts.allowPrivateHosts ?? []).some(h => h.toLowerCase() === host.toLowerCase())
+
+  if (isIP(host)) {
+    if (!allowed && isBlockedAddress(host)) throw new Error(`${host} is not a public address`)
+    return { address: host, family: isIP(host) }
+  }
+
+  // Resolved exactly once, and the address that passes is the address that is
+  // connected to. Looking it up again for the connection is the gap a zero-TTL
+  // record walks through: public for the check, loopback for the request.
+  const answers = await dns.lookup(host, { all: true }).catch((err: unknown) => {
+    throw new Error(`could not resolve ${host}: ${err instanceof Error ? err.message : String(err)}`)
+  })
+  if (answers.length === 0) throw new Error(`${host} resolved to nothing`)
+  if (!allowed) {
+    // Every answer, not just the one used: a host with one public and one
+    // private record is a bypass, not a partial success.
+    for (const { address } of answers) {
+      if (isBlockedAddress(address)) {
+        throw new Error(
+          `${host} resolves to ${address}, which is not a public address. ` +
+            `Add it to "web": { "allowPrivateHosts": [...] } if that is intended.`,
+        )
+      }
+    }
+  }
+  return { address: answers[0].address, family: answers[0].family }
+}
+
+/**
+ * One request, connected to an address that was already validated.
+ *
+ * This is the whole reason `fetch` is not used here. `fetch` resolves the host
+ * itself, so the name was looked up twice — once by the guard and once by the
+ * connection — and a DNS server that answers with a public address the first
+ * time and `127.0.0.1` the second defeats every check above. Overriding
+ * `lookup` makes the socket go to the address that passed. The `Host` header
+ * and the TLS certificate still use the real hostname, so virtual hosts and
+ * certificate validation are unaffected.
+ */
+function requestPinned(
+  url: URL,
+  pinned: { address: string; family: number },
+  signal: AbortSignal,
+): Promise<GuardedResponse> {
+  return new Promise((resolve, reject) => {
+    const transport = url.protocol === 'https:' ? https : http
+    const request = transport.request(
+      url,
+      {
+        method: 'GET',
+        signal,
+        // Both shapes: `net.connect` asks for one address or for the list,
+        // depending on the Node version, and answering the wrong one reaches
+        // the socket as `undefined`.
+        lookup: (_hostname, options, callback) => {
+          if ((options as { all?: boolean }).all) {
+            ;(callback as unknown as (
+              err: null,
+              addresses: { address: string; family: number }[],
+            ) => void)(null, [{ address: pinned.address, family: pinned.family }])
+            return
+          }
+          callback(null, pinned.address as never, pinned.family)
+        },
+        headers: {
+          // No caller-supplied headers anywhere in this file: a model that can
+          // set `Authorization` or `Cookie` can exfiltrate whatever it just read.
+          'user-agent': 'bytecode',
+          accept:
+            'text/markdown, text/plain;q=0.9, text/html;q=0.8, application/json;q=0.8, */*;q=0.5',
+          'accept-encoding': 'identity',
+        },
+      },
+      message => {
+        const status = message.statusCode ?? 0
+        resolve({
+          status,
+          ok: status >= 200 && status < 300,
+          headers: {
+            get: name => {
+              const value = message.headers[name.toLowerCase()]
+              return value === undefined ? null : Array.isArray(value) ? value.join(', ') : value
+            },
+          },
+          body: Object.assign(message as AsyncIterable<Uint8Array>, {
+            cancel: async () => {
+              message.destroy()
+            },
+          }),
+        })
+      },
+    )
+    request.on('error', reject)
+    request.end()
+  })
+}
+
+/**
  * A fetch that revalidates on every redirect.
  *
- * `redirect: 'manual'` is the point: the permission verdict is computed once,
- * from the URL the model wrote, and never recomputed — so following a redirect
- * automatically would mean approving one host and reaching another.
+ * Redirects are followed by hand: the permission verdict is computed once, from
+ * the URL the model wrote, and never recomputed — so following one automatically
+ * would mean approving one host and reaching another.
  */
 export async function fetchGuarded(
   start: URL,
@@ -126,17 +245,8 @@ export async function fetchGuarded(
 
   let current = start
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    await assertPublicHost(current, opts)
-    const response = await fetch(current, {
-      redirect: 'manual',
-      signal,
-      headers: {
-        // No caller-supplied headers anywhere in this file: a model that can set
-        // `Authorization` or `Cookie` can exfiltrate whatever it just read.
-        'user-agent': 'bytecode',
-        accept: 'text/markdown, text/plain;q=0.9, text/html;q=0.8, application/json;q=0.8, */*;q=0.5',
-      },
-    })
+    const pinned = await resolveGuarded(current, opts)
+    const response = await requestPinned(current, pinned, signal)
 
     const location = response.status >= 300 && response.status < 400 ? response.headers.get('location') : null
     if (!location) return { response, finalUrl: current.toString(), hops: hop }
@@ -149,29 +259,18 @@ export async function fetchGuarded(
 
 /** Body text, stopping at `maxBytes` instead of buffering whatever arrives. */
 export async function readCapped(
-  response: Response,
+  response: GuardedResponse,
   maxBytes: number,
 ): Promise<{ text: string; truncated: boolean }> {
-  const charset = /charset=([\w-]+)/i.exec(response.headers.get('content-type') ?? '')?.[1] ?? 'utf-8'
-  let decoder: InstanceType<typeof TextDecoder>
-  try {
-    decoder = new TextDecoder(charset)
-  } catch {
-    decoder = new TextDecoder('utf-8')
-  }
-
-  const declared = Number(response.headers.get('content-length'))
-  if (Number.isFinite(declared) && declared > maxBytes) {
-    void response.body?.cancel().catch(() => {})
-    return { text: '', truncated: true }
-  }
-
   if (!response.body) return { text: '', truncated: false }
 
+  // A `content-length` over the cap used to return nothing at all: a 3 MB page
+  // read as an empty one, with no way to tell the difference from a blank page.
+  // The stream is capped below, so the first `maxBytes` come back either way.
   const chunks: Uint8Array[] = []
   let size = 0
   let truncated = false
-  for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
+  for await (const chunk of response.body) {
     if (size + chunk.byteLength > maxBytes) {
       chunks.push(chunk.subarray(0, maxBytes - size))
       truncated = true
@@ -181,7 +280,43 @@ export async function readCapped(
     size += chunk.byteLength
   }
   void response.body.cancel().catch(() => {})
-  return { text: decoder.decode(Buffer.concat(chunks)), truncated }
+
+  const bytes = Buffer.concat(chunks)
+  const declared = /charset=["']?([\w-]+)/i.exec(response.headers.get('content-type') ?? '')?.[1]
+  return { text: decodeBody(bytes, declared), truncated }
+}
+
+/**
+ * Bytes to text, preferring the encoding the document itself declares.
+ *
+ * A server that sends `text/html` with no charset, or the wrong one, is
+ * ordinary; the page then says what it is in a `<meta>` tag, and ignoring that
+ * turns every accented character into mojibake. The header still wins when both
+ * agree, and an unknown label falls back to UTF-8 rather than failing.
+ */
+function decodeBody(bytes: Buffer, declared: string | undefined): string {
+  const decode = (charset: string | undefined): string | null => {
+    if (!charset) return null
+    try {
+      return new TextDecoder(charset).decode(bytes)
+    } catch {
+      return null
+    }
+  }
+
+  const fromHeader = decode(declared)
+  if (fromHeader !== null && declared && !/^(utf-?8|us-ascii)$/i.test(declared)) return fromHeader
+
+  // Read from the head of the document, where a charset declaration has to be.
+  const head = bytes.subarray(0, 4096).toString('latin1')
+  const meta =
+    /<meta[^>]+charset\s*=\s*["']?([\w-]+)/i.exec(head)?.[1] ??
+    /<\?xml[^>]+encoding\s*=\s*["']([\w-]+)/i.exec(head)?.[1]
+  if (meta && !/^utf-?8$/i.test(meta)) {
+    const fromMeta = decode(meta)
+    if (fromMeta !== null) return fromMeta
+  }
+  return fromHeader ?? bytes.toString('utf8')
 }
 
 const ENTITIES: Record<string, string> = {

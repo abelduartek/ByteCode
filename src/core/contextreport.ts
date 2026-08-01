@@ -8,7 +8,7 @@ import {
   mcpInstructionsBlock,
   skillsBlock,
 } from './context.ts'
-import { contextLimit, contextTokens, estimateTokens } from './compaction.ts'
+import { contextLimit, contextTokens, estimateTokens, estimateTokensForChars } from './compaction.ts'
 
 // What is actually in the context window, broken down. `/context` answers "how
 // full is it"; this answers "full of what" — which is the question you have when
@@ -191,7 +191,9 @@ export function formatContextReport(session: Session): string {
       const state = s.disabled ? '○ desligado' : s.connected ? '● ok' : `✕ ${s.error ?? 'falhou'}`
       out.push(
         `| ${s.name} | ${s.source} | ${state} | ${s.tools} | ` +
-          `${s.instructions > 0 ? `${estimateTokens('x'.repeat(s.instructions))} tokens` : '—'} |`,
+          // From the count, not from a string built to be measured: allocating a
+          // copy of the instructions just to divide its length by four.
+          `${s.instructions > 0 ? `${estimateTokensForChars(s.instructions)} tokens` : '—'} |`,
       )
     }
   }

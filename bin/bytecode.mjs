@@ -23,7 +23,7 @@ const argv = process.argv.slice(2)
  */
 const QUIET = new Set([
   '-v', '--version', '-h', '--help', '-p', '--print',
-  'init', 'models', 'config', 'schema', 'mcp', 'doctor', 'setup',
+  'init', 'import', 'models', 'config', 'schema', 'mcp', 'doctor', 'setup',
   'sessions', 'connect', 'disconnect', 'auth',
 ])
 const interactive = !argv.some(a => QUIET.has(a))

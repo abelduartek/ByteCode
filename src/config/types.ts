@@ -224,6 +224,16 @@ export type Config = {
   /** Tool names removed from the registry entirely. */
   disabledTools?: string[]
   effort?: EffortLevel
+  reasoning?: {
+    /**
+     * Whether this provider streams its reasoning as literal `<think>` tags in
+     * the content channel, which the loop then has to split out. Guessed from
+     * the provider package when unset — on for OpenAI-compatible endpoints, off
+     * for providers with a real reasoning channel, where filtering would eat the
+     * tags out of an answer that is legitimately about them.
+     */
+    inlineThinkTags?: boolean
+  }
   maxOutputTokens?: number
   /**
    * Refuse a write that would clobber a file the session never read, or one that

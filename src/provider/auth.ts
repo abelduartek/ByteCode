@@ -14,6 +14,12 @@ export type AuthEntry = {
   token?: string
   /** Set when the user connected to a non-default endpoint. */
   baseURL?: string
+  /**
+   * Set when the user was offered the environment variable during `connect` and
+   * chose to type a key instead. Without it, the variable they just declined
+   * went on winning at every model call.
+   */
+  ignoreEnv?: boolean
   connectedAt?: string
 }
 
@@ -77,7 +83,16 @@ export async function saveCredential(
   const file = authPath()
   await ensureDir(path.dirname(file))
   const store = await readAuthFile(file)
-  store[providerId] = { type: 'api', connectedAt: new Date().toISOString(), ...entry }
+  // Merged over what was there. Replacing the entry outright meant that
+  // rotating a key dropped the `baseURL` saved with it, and the next call went
+  // to the provider's default endpoint instead of the one that was configured.
+  const previous = store[providerId] ?? {}
+  store[providerId] = {
+    ...previous,
+    type: 'api',
+    connectedAt: new Date().toISOString(),
+    ...entry,
+  }
   await fs.writeFile(file, `${JSON.stringify(store, null, 2)}\n`, 'utf8')
   // No-op on Windows, meaningful everywhere else.
   try {
@@ -88,21 +103,37 @@ export async function saveCredential(
   return file
 }
 
+/**
+ * Removes a credential from every store the resolver reads.
+ *
+ * The pre-rename file counts: deleting only from the current one left the old
+ * copy in place, `disconnect` reported success, and the provider went on
+ * authenticating with the credential the user had just removed.
+ */
 export async function removeCredential(providerId: string): Promise<boolean> {
-  const file = authPath()
-  const store = await readAuthFile(file)
-  if (!(providerId in store)) return false
-  delete store[providerId]
-  await fs.writeFile(file, `${JSON.stringify(store, null, 2)}\n`, 'utf8')
-  return true
+  let removed = false
+  for (const file of stateFiles('auth.json')) {
+    const store = await readAuthFile(file)
+    if (!(providerId in store)) continue
+    delete store[providerId]
+    await fs.writeFile(file, `${JSON.stringify(store, null, 2)}\n`, 'utf8')
+    removed = true
+  }
+  return removed
 }
 
 export async function connectedProviders(): Promise<string[]> {
   return Object.keys(await readAuth()).sort()
 }
 
-/** Never log a key; this is what gets shown instead. */
+/**
+ * Never log a key; this is what gets shown instead.
+ *
+ * The ends are shown only when there is enough key for them to be a hint rather
+ * than the key: at nine characters, `abcd...fghi` was eight of the nine. Short
+ * keys mask to a fixed width so the output does not leak the length either.
+ */
 export function maskKey(key: string): string {
-  if (key.length <= 8) return '*'.repeat(key.length)
-  return `${key.slice(0, 4)}...${key.slice(-4)}`
+  if (key.length < 16) return '*'.repeat(8)
+  return `${key.slice(0, 4)}${'*'.repeat(6)}${key.slice(-4)}`
 }

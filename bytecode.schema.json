@@ -444,6 +444,16 @@
         "max"
       ]
     },
+    "reasoning": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "inlineThinkTags": {
+          "type": "boolean",
+          "description": "Whether the provider streams reasoning as literal <think> tags inside the content. Guessed from the provider package when unset."
+        }
+      }
+    },
     "maxOutputTokens": {
       "type": "number"
     },

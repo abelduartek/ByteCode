@@ -3,7 +3,7 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import type { Config } from '../config/types.ts'
 import { brokenAuthFiles, openCodeAuthPaths, authPath, readAuthFile } from '../provider/auth.ts'
-import { CLI, LEGACY_CLI, hasLegacyState, legacyStateDir, stateDir } from '../util/paths.ts'
+import { CLI, LEGACY_CLI, hasLegacyState, legacyStateDir, stateDir, stateFiles } from '../util/paths.ts'
 import { resolveModel } from '../provider/registry.ts'
 import { discoverMcpServers, inheritableMcpServers } from '../mcp/discover.ts'
 
@@ -49,14 +49,35 @@ async function credentialSource(
   if (typeof provider.options?.apiKey === 'string' && provider.options.apiKey) {
     return { kind: 'config', detail: 'options.apiKey (em arquivo de config)' }
   }
-  for (const name of provider.env ?? []) {
-    if (process.env[name]) return { kind: 'env', detail: `$${name}` }
-  }
-  const conventional = `${providerId.replace(/[^A-Za-z0-9]/g, '_').toUpperCase()}_API_KEY`
-  if (process.env[conventional]) return { kind: 'env', detail: `$${conventional}` }
 
-  const own = await readAuthFile(authPath())
-  if (own[providerId]) return { kind: 'store', detail: authPath() }
+  // Both stores are read here, in the same order the resolver reads them —
+  // including the pre-rename file. Skipping it made `doctor` report "nenhuma
+  // credencial" for a provider that was authenticating perfectly well from
+  // ~/.hx/auth.json, which is the opposite of what this command is for.
+  const stores = stateFiles('auth.json')
+  let storeFile: string | undefined
+  let ignoreEnv = false
+  for (const file of stores) {
+    const entry = (await readAuthFile(file))[providerId]
+    if (!entry) continue
+    if (entry.ignoreEnv) ignoreEnv = true
+    storeFile ??= file
+  }
+
+  if (!ignoreEnv) {
+    for (const name of provider.env ?? []) {
+      if (process.env[name]) return { kind: 'env', detail: `$${name}` }
+    }
+    const conventional = `${providerId.replace(/[^A-Za-z0-9]/g, '_').toUpperCase()}_API_KEY`
+    if (process.env[conventional]) return { kind: 'env', detail: `$${conventional}` }
+  }
+
+  if (storeFile) {
+    return {
+      kind: 'store',
+      detail: ignoreEnv ? `${storeFile} (env ignorada a pedido do connect)` : storeFile,
+    }
+  }
 
   if (config.openCodeAuth) {
     for (const file of openCodeAuthPaths()) {

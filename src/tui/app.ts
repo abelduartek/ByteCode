@@ -1,6 +1,6 @@
 import readline from 'node:readline'
 import type { Session, UIEvent, PermissionRequest } from '../core/session.ts'
-import { runTurn } from '../core/loop.ts'
+import { describeError, runTurn, TurnFailure } from '../core/loop.ts'
 import { compact, contextLimit, contextTokens } from '../core/compaction.ts'
 import { formatLeadtime, summarizeTurn } from '../core/leadtime.ts'
 import { formatWhen, listSessions, loadSession } from '../core/sessions.ts'
@@ -106,7 +106,15 @@ export async function runTui(session: Session): Promise<void> {
   session.requestPermission = (req: PermissionRequest) =>
     askPermission(rl, session, req)
 
-  process.on('SIGINT', () => {
+  /**
+   * Ctrl+C, from wherever it can arrive.
+   *
+   * `process.on('SIGINT')` alone was dead code on a terminal: readline puts
+   * stdin in raw mode, so Ctrl+C never becomes a signal — it arrives as the byte
+   * `0x03` and readline turns it into the interface's own `SIGINT` event. That
+   * left the one thing this exists for, stopping a streaming turn, impossible.
+   */
+  function interrupt(): void {
     if (streaming) {
       session.abort?.abort()
       endLine()
@@ -117,12 +125,42 @@ export async function runTui(session: Session): Promise<void> {
     interrupts++
     if (interrupts >= 2) {
       write('\n')
+      // `rl.close()` ends the `for await` below, so the caller's cleanup — the
+      // SessionEnd hook, the transcript flush, closing MCP — actually runs.
+      // `process.exit(0)` here skipped all of it.
       rl.close()
-      process.exit(0)
+      return
     }
     write(color.gray('\n(press Ctrl+C again to exit)\n'))
     prompt()
-  })
+  }
+
+  // Piped stdin, or a terminal where readline is not the one reading.
+  process.on('SIGINT', interrupt)
+  // A terminal, at the prompt.
+  rl.on('SIGINT', interrupt)
+
+  /**
+   * A turn pauses readline, so nothing is watching stdin while the model
+   * streams — which is exactly when the user wants to be able to interrupt.
+   * Reads Ctrl+C directly for the duration, and drops whatever else was typed
+   * rather than letting it echo into the streamed output.
+   */
+  function watchInterrupts(): () => void {
+    const stdin = process.stdin
+    if (!stdin.isTTY) return () => {}
+    const wasRaw = stdin.isRaw
+    stdin.setRawMode(true)
+    stdin.resume()
+    const onData = (chunk: Buffer): void => {
+      if (chunk.includes(0x03)) interrupt()
+    }
+    stdin.on('data', onData)
+    return () => {
+      stdin.off('data', onData)
+      if (!wasRaw) stdin.setRawMode(false)
+    }
+  }
 
   // Screen 09 of the design: no bars, no viewport — one identity line, then the
   // same glyph vocabulary as the full-screen UI.
@@ -151,7 +189,16 @@ export async function runTui(session: Session): Promise<void> {
     interrupts = 0
 
     if (line.startsWith('/')) {
-      const handled = await handleCommand(session, line, write, rl)
+      // A failing command reports and returns to the prompt. Letting it throw
+      // ended the session and skipped the caller's cleanup with it.
+      let handled: CommandResult
+      try {
+        handled = await handleCommand(session, line, write, rl)
+      } catch (err) {
+        write(`${color.red(symbols.fail)} ${color.red(describeError(err))}\n`)
+        prompt()
+        continue
+      }
       if (handled === 'exit') break
       if (handled === 'handled') {
         prompt()
@@ -167,11 +214,17 @@ export async function runTui(session: Session): Promise<void> {
 
     streaming = true
     rl.pause()
+    const stopWatching = watchInterrupts()
     try {
       await runTurn(session, text)
     } catch (err) {
-      endLine()
-      write(`${color.red(symbols.fail)} ${color.red(String(err))}\n`)
+      // A failure the loop already streamed as an error event is not repeated.
+      if (!(err instanceof TurnFailure && err.shown)) {
+        endLine()
+        write(`${color.red(symbols.fail)} ${color.red(describeError(err))}\n`)
+      }
+    } finally {
+      stopWatching()
     }
     streaming = false
     // The design's --simple screen has no rulers: a blank line separates turns.
@@ -193,19 +246,36 @@ function askPermission(
     const subject = req.subject ? `\n  ${color.gray(req.subject)}` : ''
     process.stdout.write(
       `\n${color.yellow('permission')} ${color.bold(req.tool)} ${req.summary}${subject}\n` +
-        color.gray('  [y] allow once  [a] allow this tool for the session  [n] deny\n'),
+        color.gray('  [y] allow once  [a] allow this tool for the session  [n] deny  (enter = deny)\n'),
     )
+    // Ctrl+D, or piped input that ran out, closes the interface. Without this the
+    // promise never settles: the tool call waits forever behind a prompt that is
+    // no longer on screen, and the turn cannot be interrupted out of it either.
+    const onClose = (): void => resolve(false)
+    rl.once('close', onClose)
     rl.resume()
     rl.question(`${color.yellow('?')} `, answer => {
+      rl.removeListener('close', onClose)
+      // Paused again so keystrokes during the rest of the turn do not echo into
+      // the streamed output.
+      rl.pause()
       const a = answer.trim().toLowerCase()
       if (a === 'a') {
         session.config.permissions ??= {}
         session.config.permissions.allow ??= []
-        session.config.permissions.allow.push(req.tool)
+        // Ahead of the rules already there: an `ask` rule matching this tool
+        // outranks a plain `allow`, so appending left "allow for the session"
+        // asking again on the very next call.
+        session.config.permissions.allow.unshift(req.tool)
+        session.config.permissions.ask = (session.config.permissions.ask ?? []).filter(
+          rule => rule !== req.tool && !rule.startsWith(`${req.tool}(`),
+        )
         resolve(true)
         return
       }
-      resolve(a === 'y' || a === 'yes' || a === '')
+      // Bare enter used to mean "allow". A prompt whose safest answer is the one
+      // you get by leaning on the keyboard is not a permission prompt.
+      resolve(a === 'y' || a === 'yes')
     })
   })
 }
@@ -263,8 +333,7 @@ async function handleCommand(
         return 'handled'
       }
       try {
-        session.setModel(arg)
-        session.resolveModel()
+        session.setModelChecked(arg)
         write(color.green(`model → ${arg}\n`))
       } catch (err) {
         write(color.red(`${String(err)}\n`))
@@ -277,7 +346,14 @@ async function handleCommand(
 
     case 'connect': {
       const io = ioFromReadline(rl)
-      const result = await runConnect(io, { provider: arg || undefined })
+      // `local` is what makes a provider declared in the config connectable. The
+      // CLI passes it; without it here, `/connect meu-gateway` searched
+      // models.dev and answered "unknown provider" for something the user had
+      // written into their own config.
+      const result = await runConnect(io, {
+        provider: arg || undefined,
+        local: session.config.provider,
+      })
       if (result) {
         // Make the new provider usable without restarting.
         session.config.provider = (await withConnectedProviders(session.config)).provider

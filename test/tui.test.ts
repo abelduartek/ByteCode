@@ -950,6 +950,127 @@ key('\x12')
 await tick(150)
 check('ctrl+r colapsou', !has('linha 2'), '')
 
+// O modelo pede quatro tools numa decisão só; o Claude CLI escreve isso em uma
+// frase. Quatro linhas para uma decisão é ruído — e o lote dobra JÁ RODANDO,
+// senão a tela mostra quatro linhas e depois as engole.
+log('--- lote do mesmo passo vira uma linha ---')
+{
+  const lote = [
+    { id: 'b1', name: 'Grep', summary: 'grep', subject: 'US156501' },
+    { id: 'b2', name: 'Read', summary: 'read', subject: 'src/core/loop.ts' },
+    { id: 'b3', name: 'Read', summary: 'read', subject: 'src/core/session.ts' },
+    { id: 'b4', name: 'LS', summary: 'ls', subject: 'src' },
+    { id: 'b5', name: 'Bash', summary: 'bash', subject: 'wc -l src/**/*.ts' },
+  ]
+  for (const t of lote) session.emit({ type: 'tool-start', ...t, step: 7 } as never)
+  await tick(200)
+  const frase = () => lines().find(l => l.includes('buscando 1 padrão')) ?? ''
+  check('lote vira uma frase só', frase().length > 0, JSON.stringify(lines().slice(-14)))
+  check('conta por categoria, na ordem em que o modelo pediu',
+    /buscando 1 padrão, lendo 2 arquivos, listando 1 diretório e rodando 1 comando/.test(frase()),
+    JSON.stringify(frase()))
+  check('dobra enquanto roda', frase().includes('…'), JSON.stringify(frase()))
+  check('uma linha, não cinco', lines().filter(l => l.includes('buscando 1 padrão')).length === 1,
+    String(lines().filter(l => l.includes('buscando 1 padrão')).length))
+  check('não mostra Read( solto do lote', !lines().some(l => l.includes('Read(src/core/session.ts')),
+    JSON.stringify(lines().slice(-10)))
+
+  for (const t of lote) session.emit({ type: 'tool-end', id: t.id, name: t.name, ok: true, preview: 'ok\nok' })
+  await tick(200)
+  check('lote pronto perde as reticências', frase().length > 0 && !frase().includes('…'), JSON.stringify(frase()))
+
+  // ctrl+r continua alcançando a chamada individual: a dobra é do desenho, os
+  // blocos continuam lá.
+  key('\x12')
+  await tick(200)
+  check('ctrl+r abre o lote', has('Bash(') || has('Read('), JSON.stringify(lines().slice(-10)))
+  key('\x12')
+  await tick(200)
+  check('ctrl+r volta a dobrar', frase().length > 0, JSON.stringify(lines().slice(-8)))
+
+  // Uma falha no lote pinta o lote inteiro de vermelho: o resumo responde por
+  // todas as chamadas que ele escondeu.
+  session.emit({ type: 'tool-start', id: 'c1', name: 'Read', summary: 'r', subject: 'a.ts', step: 8 } as never)
+  session.emit({ type: 'tool-start', id: 'c2', name: 'Read', summary: 'r', subject: 'b.ts', step: 8 } as never)
+  await tick(160)
+  session.emit({ type: 'tool-end', id: 'c1', name: 'Read', ok: true, preview: 'ok' })
+  session.emit({ type: 'tool-end', id: 'c2', name: 'Read', ok: false, preview: 'ENOENT' })
+  await tick(200)
+  // A frase do lote anterior tambem contem "lendo 2 arquivos" ("buscando 1
+  // padrao, lendo 2 arquivos, ..."), entao procurar a primeira ocorrencia
+  // achava aquela linha — verde, do lote que deu certo — e nao esta.
+  const dois = lines().findIndex(l => l.includes('lendo 2 arquivos') && !l.includes('buscando'))
+  check('lote de dois também dobra', dois >= 0, JSON.stringify(lines().slice(-8)))
+  check('falha no lote marca o lote', (screen[dois] ?? '').includes('38;5;167'),
+    JSON.stringify((screen[dois] ?? '').slice(0, 40)))
+}
+
+// Colar um log de mil linhas no composer nao pode empurrar a conversa pra fora
+// da tela: dobra num marcador, e o texto inteiro so aparece pro modelo.
+log('--- paste grande dobra em anexo ---')
+{
+  const gigante = Array.from({ length: 400 }, (_, i) => `at com.foo.Bar${i}(Bar.java:${i})`).join(String.fromCharCode(10))
+  key(`${ESC}[200~${gigante}${ESC}[201~`)
+  await tick(250)
+
+  check('nao despeja o log no composer', !has('at com.foo.Bar300'), JSON.stringify(lines().slice(-6)))
+  check('mostra um marcador no lugar', has('[Pasted text #') , JSON.stringify(lines().slice(-6)))
+  check('marcador diz o tamanho', lines().some(l => /\+400 lines/.test(l)), JSON.stringify(lines().slice(-6)))
+  check('explica como remover', has('apague o marcador'), JSON.stringify(lines().slice(-4)))
+
+  // backspace apaga o marcador como qualquer texto: e assim que se solta o anexo.
+  for (let i = 0; i < 30; i++) key('')
+  await tick(200)
+  check('backspace remove o marcador', !has('[Pasted text #'), JSON.stringify(lines().slice(-5)))
+}
+// O terminal manda CR como quebra dentro do bracketed paste, nao LF. Contar so
+// LF dizia '+1 lines' para um stack trace de 400 linhas — foi esse o bug.
+log('--- paste com CR conta as linhas certas ---')
+{
+  const linhas = Array.from({ length: 300 }, (_, i) => `at com.baz.Qux${i}(Qux.java:${i})`)
+  key(`${ESC}[200~${linhas.join(String.fromCharCode(13))}${ESC}[201~`)
+  await tick(250)
+
+  check('dobra mesmo com CR', has('[Pasted text #'), JSON.stringify(lines().slice(-5)))
+  check('conta as 300 linhas, nao 1', lines().some(l => /\+300 lines/.test(l)),
+    JSON.stringify(lines().filter(l => l.includes('Pasted text'))))
+
+  for (let i = 0; i < 30; i++) key('')
+  await tick(200)
+}
+
+// alt+v anexa a imagem do clipboard. ctrl+v tambem serve, mas a maioria dos
+// terminais intercepta o ctrl+v como o proprio 'colar' e ele nunca chega aqui.
+log('--- alt+v anexa imagem do clipboard ---')
+{
+  const clip = await import(`${R}/util/clipboard.ts`)
+  const PNG = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    Buffer.alloc(2048, 7),
+  ])
+
+  // Sem imagem no clipboard, o atalho tem que dizer isso e nao anexar nada.
+  clip.setFakeClipboardImage(null)
+  key(`${ESC}v`)
+  await tick(300)
+  check('sem imagem avisa', has('nenhuma imagem no clipboard'), JSON.stringify(lines().slice(-3)))
+  check('e nao inventa anexo', !has('[Image #'), JSON.stringify(lines().slice(-4)))
+
+  clip.setFakeClipboardImage({ data: PNG, mediaType: 'image/png' })
+  key(`${ESC}v`)
+  await tick(400)
+  check('alt+v poe o marcador no composer', has('[Image #'), JSON.stringify(lines().slice(-5)))
+  check('mostra o que foi anexado', has('imagem') && has('png'), JSON.stringify(lines().slice(-5)))
+  check('mostra o tamanho', lines().some(l => /KB|B/.test(l) && l.includes('png')),
+    JSON.stringify(lines().filter(l => l.includes('png'))))
+
+  // backspace solta o anexo, igual ao texto dobrado.
+  for (let i = 0; i < 14; i++) key('')
+  await tick(200)
+  check('backspace remove a imagem', !has('[Image #'), JSON.stringify(lines().slice(-5)))
+  clip.setFakeClipboardImage(null)
+}
+
 log('--- 08 · divisor de compactacao ---')
 session.emit({ type: 'notice', text: 'compacted: ~5659 -> ~371 tokens' })
 await tick(150)
@@ -1053,13 +1174,21 @@ log('--- scroll ---')
   await tick(140)
   check('pgdn no fim nao quebra', scrolled() === 0, String(scrolled()))
 
-  // Bloco novo tem de grudar de volta no fim.
+  // Quem rolou para tras fica onde estava: puxar de volta pro fim a cada evento
+  // torna impossivel ler o historico enquanto o turno responde. O texto lido
+  // continua nas mesmas linhas, e ctrl+end e que volta pro fim.
   key(`${ESC}[5~`)
   await tick(140)
   check('rolado antes do bloco novo', scrolled() === 10, String(scrolled()))
+  const antes = snapshot()
   session.emit({ type: 'notice', text: 'bloco novo chegou' })
   await tick(160)
-  check('bloco novo gruda no fim', scrolled() === 0, String(scrolled()))
+  check('bloco novo nao puxa a vista', scrolled() > 0, String(scrolled()))
+  check('a vista fica ancorada no mesmo texto', snapshot() === antes, '')
+  key(`${ESC}[1;5F`) // ctrl+end
+  await tick(160)
+  check('ctrl+end ainda volta ao fim', scrolled() === 0, String(scrolled()))
+  check('e o bloco novo esta la', has('bloco novo chegou'), '')
 }
 
 log('--- seleção por caractere ---')
@@ -1158,7 +1287,11 @@ log('--- marca ByteCode ---')
   check('todas as linhas tem a mesma largura de arte', new Set(ART.map(r => r.length)).size === 1, '')
   check('BYTE e CODE em cores diferentes', /38;5;\d+m█▀▄ █ █ ▀█▀ █▀▀/.test(screen[0] ?? ''), (screen[0] ?? '').slice(0, 60))
   check('sem HardX em lugar nenhum', !rawFrame().includes('HardX'), '')
-  check('nao repete o nome em texto ao lado da arte', !head.join(' ').includes('ByteCode'), '')
+  // Sem o cwd: o repositório se chama ByteCode, então o caminho no cabeçalho
+  // casaria com a checagem sem que nada tivesse repetido o nome.
+  const semCaminho = head.join(' ').split(cwd).join('')
+  check('nao repete o nome em texto ao lado da arte', !semCaminho.includes('ByteCode'),
+    JSON.stringify(semCaminho.slice(0, 80)))
   check('versao ao lado da arte', head.join(' ').includes('v0.1'), '')
   check('header nao estoura a largura', head.every(l => l.length <= 140), JSON.stringify(head.map(l => l.length)))
 
@@ -1914,6 +2047,138 @@ log('--- /context-all detalha o contexto ---')
   check('tools ativas listadas', r.tools.active.length > 0, String(r.tools.active.length))
   check('conversa contabilizada por papel', r.messages.length > 0, JSON.stringify(r.messages))
   check('limite vem do modelo', r.limit === 1000, String(r.limit))
+}
+
+log('--- /add-provider: modal de formulário ---')
+{
+  // Nenhum caminho deste bloco chega a gravar: a suíte roda com cwd na raiz do
+  // repo, e um submit bem-sucedido escreveria no `hx.jsonc` de verdade. O que se
+  // verifica aqui é a navegação, o mascaramento e as recusas — o writer em si
+  // tem suíte própria (`configwrite.test.ts`), contra arquivos de scratch.
+  const FAKE_KEY = 'sk-gw-teste-NAO-REAL-987654321'
+
+  key('/add-provider\r')
+  const opened = await waitFor(() => has('add provider') && has('base URL'), 8000)
+  check('/add-provider abre o formulário', opened,
+    JSON.stringify(lines().filter(l => l.trim()).slice(0, 6)))
+  check('todos os campos ficam visíveis de uma vez',
+    has('base URL') && has('id do modelo') && has('contexto') && has('API key'),
+    JSON.stringify(lines().filter(l => l.trim()).slice(0, 14)))
+  check('diz onde vai gravar', has('grava em'), JSON.stringify(lines().find(l => l.includes('grava'))))
+  check('mostra os defaults como placeholder', has('@ai-sdk/openai-compatible'),
+    JSON.stringify(lines().find(l => l.includes('ai-sdk'))))
+
+  // O primeiro campo tem o foco, então digitar vai para ele e não para o composer.
+  key('gw-teste')
+  await tick(200)
+  check('digita no campo em foco', has('gw-teste'), JSON.stringify(lines().find(l => l.includes('gw'))))
+
+  // tab desce, shift+tab sobe: o valor de cada campo tem de ficar onde estava.
+  key('\t')
+  await tick(160)
+  key('Gateway')
+  await tick(200)
+  check('tab move para o próximo campo', has('Gateway') && has('gw-teste'),
+    JSON.stringify(lines().filter(l => l.includes('gw') || l.includes('Gateway')).slice(0, 3)))
+
+  key(`${ESC}[Z`)
+  await tick(160)
+  key('X')
+  await tick(200)
+  check('shift+tab volta para o campo anterior', has('gw-testeX'),
+    JSON.stringify(lines().find(l => l.includes('gw-teste'))))
+
+  // ctrl+u limpa só o campo em foco.
+  key('\x15')
+  await tick(180)
+  check('ctrl+u limpa o campo', !has('gw-testeX') && has('Gateway'),
+    JSON.stringify(lines().filter(l => l.includes('Gateway')).slice(0, 2)))
+
+  // Enter no meio do formulário avança em vez de enviar: um enter perdido não
+  // pode gravar um provider com os campos de baixo vazios.
+  key('\r')
+  await tick(200)
+  check('enter no meio não envia', has('add provider') && has('base URL'), '')
+
+  // A chave é o último campo e o único mascarado; colar nele não pode vazar.
+  // O enter acima já moveu para o campo 1, então faltam 8 para chegar no 9.
+  for (let i = 0; i < 8; i++) key('\t')
+  await tick(200)
+  key(`${ESC}[200~${FAKE_KEY}\n${ESC}[201~`)
+  await tick(240)
+  check('chave não aparece em texto puro', !rawFrame().includes(FAKE_KEY), '')
+  check('campo da chave é mascarado', (rawFrame().match(/•/g) ?? []).length >= FAKE_KEY.length,
+    String((rawFrame().match(/•/g) ?? []).length))
+  check('a quebra de linha do paste não enviou o formulário', has('add provider'), '')
+
+  // Do último campo, o enter valida: os obrigatórios ainda estão vazios.
+  key('\r')
+  await tick(280)
+  check('campo obrigatório vazio bloqueia o envio', has('obrigatório') && has('add provider'),
+    JSON.stringify(lines().find(l => l.includes('obrigat'))))
+
+  key(ESC)
+  await tick(220)
+  check('esc cancela sem gravar', has('add-provider cancelado'),
+    JSON.stringify(lines().at(-2)?.slice(0, 60)))
+
+  // Um id que já existe é recusado antes de qualquer escrita — `fake` é o
+  // provider desta suíte.
+  key('/add-provider fake\r')
+  await waitFor(() => has('add provider'), 6000)
+  check('aceita o id como argumento', has('fake'), JSON.stringify(lines().find(l => l.includes('fake'))))
+  // Os obrigatórios precisam estar preenchidos para o envio chegar na checagem
+  // de duplicata — senão o que se testaria era a validação de novo.
+  for (let i = 0; i < 5; i++) key('\t')
+  key('tiny')
+  key('\t')
+  key('tiny')
+  await tick(220)
+  for (let i = 0; i < 3; i++) key('\t')
+  await tick(200)
+  key('\r')
+  await tick(320)
+  check('id duplicado é recusado', has('já existe'),
+    JSON.stringify(lines().filter(l => l.includes('existe')).slice(0, 2)))
+  check('nada foi gravado', !has('adicionado'), '')
+}
+
+log('--- /add-model: picker de provider e formulário ---')
+{
+  // Como no bloco acima, nada aqui chega a gravar: o provider `fake` desta suíte
+  // vem de BYTECODE_CONFIG_CONTENT e não está declarado em arquivo nenhum, então
+  // o fluxo para na checagem que existe justamente para esse caso. O writer tem
+  // suíte própria, contra arquivos de scratch.
+  key('/add-model\r')
+  const opened = await waitFor(() => has('em qual provider') && has('filtro'), 8000)
+  check('/add-model abre o picker de provider', opened,
+    JSON.stringify(lines().filter(l => l.trim()).slice(0, 6)))
+  check('lista o provider configurado', has('fake'),
+    JSON.stringify(lines().find(l => l.includes('fake'))))
+  check('mostra quantos modelos ele tem', lines().some(l => l.includes('modelo')),
+    JSON.stringify(lines().find(l => l.includes('modelo'))))
+  check('o picker filtra como os outros', has('digite para filtrar'), '')
+
+  key(ESC)
+  await tick(220)
+  check('esc no picker não abre o formulário', !has('id do modelo'), '')
+
+  // Com o provider escolhido por argumento, o fluxo recusa antes de qualquer
+  // escrita: gravar noutro arquivo criaria uma segunda declaração parcial dele.
+  key('/add-model fake\r')
+  await tick(420)
+  check('provider sem arquivo é recusado antes de gravar', has('declarado'),
+    JSON.stringify(lines().filter(l => l.includes('declarado')).slice(0, 2)))
+  check('e diz o que fazer', has('add-provider'),
+    JSON.stringify(lines().find(l => l.includes('add-provider'))))
+  check('nada foi gravado', !has('adicionado'), '')
+
+  key('/add-model naoexiste\r')
+  await tick(420)
+  check('id desconhecido cai no picker em vez de inventar', has('em qual provider'),
+    JSON.stringify(lines().filter(l => l.trim()).slice(0, 4)))
+  key(ESC)
+  await tick(220)
 }
 
 log('--- exit ---')

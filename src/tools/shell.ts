@@ -1,11 +1,39 @@
 import { spawn } from 'node:child_process'
 import path from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import type { ToolDefinition } from '../core/tools.ts'
-import { describeJob, getJob, killJob, listJobs, readJob, startJob } from '../core/jobs.ts'
+import { describeJob, getJob, killJob, killTree, listJobs, readJob, startJob } from '../core/jobs.ts'
 import { posixShell } from '../util/binaries.ts'
 
 const DEFAULT_TIMEOUT_MS = 120_000
 const MAX_TIMEOUT_MS = 600_000
+
+/**
+ * How long a killed command has to actually die before the turn stops waiting.
+ *
+ * `close` fires when every pipe is closed, not when the shell exits, so a
+ * grandchild holding stdout keeps the promise pending forever — the turn hangs
+ * with no way out, which is the one thing a timeout exists to prevent.
+ */
+const KILL_GRACE_MS = 2_000
+
+/**
+ * Cap per stream. The turn truncates a tool result long before this, so the only
+ * thing an unbounded buffer buys is a `RangeError: Invalid string length` from a
+ * command that prints faster than it finishes. The **tail** is kept: for a test
+ * run the verdict is at the end.
+ */
+const MAX_OUTPUT_CHARS = 200_000
+
+/** A number the model may have sent as `0`, `"30s"` or not at all. */
+function timeoutFrom(raw: unknown): number {
+  if (raw === undefined || raw === null) return DEFAULT_TIMEOUT_MS
+  const ms = Number(raw)
+  // `0` and `NaN` both used to reach `setTimeout`, which fires on the next tick:
+  // the command was killed before it produced a single byte.
+  if (!Number.isFinite(ms) || ms <= 0) return DEFAULT_TIMEOUT_MS
+  return Math.min(ms, MAX_TIMEOUT_MS)
+}
 
 /** One display line for a command that may span several. */
 function oneLineCommand(command: string): string {
@@ -30,13 +58,25 @@ function stripPreamble(text: string): string {
   return text.split('\n').filter(line => !line.includes(UTF8_PREAMBLE)).join('\n')
 }
 
-type RunResult = { code: number | null; stdout: string; stderr: string; timedOut: boolean }
+type RunResult = {
+  code: number | null
+  stdout: string
+  stderr: string
+  timedOut: boolean
+  /** Killed, but still holding a pipe when the turn stopped waiting for it. */
+  abandoned?: boolean
+}
 
 function spawnFor(
   command: string,
   shell: 'posix' | 'powershell',
   cwd: string,
+  opts: { detached?: boolean } = {},
 ): ReturnType<typeof spawn> {
+  // Its own process group, so killing it kills the pipeline it started and not
+  // just the shell. Windows has no groups — `taskkill /T` walks the tree there.
+  const detached = opts.detached === true && process.platform !== 'win32'
+
   if (shell === 'powershell') {
     return spawn(
       'powershell.exe',
@@ -60,11 +100,11 @@ function spawnFor(
     const env = posix.toolPath
       ? { ...process.env, PATH: `${posix.toolPath}${path.delimiter}${process.env.PATH ?? ''}` }
       : process.env
-    return spawn(posix.file, ['-c', command], { cwd, windowsHide: true, env })
+    return spawn(posix.file, ['-c', command], { cwd, windowsHide: true, env, detached })
   }
 
   // macOS and Linux: `shell: true` is /bin/sh, which is what we want.
-  return spawn(command, { cwd, shell: true, windowsHide: true })
+  return spawn(command, { cwd, shell: true, windowsHide: true, detached })
 }
 
 function run(
@@ -72,39 +112,84 @@ function run(
   opts: { cwd: string; shell: 'posix' | 'powershell'; timeoutMs: number; signal?: AbortSignal },
 ): Promise<RunResult> {
   return new Promise(resolve => {
-    const child = spawnFor(command, opts.shell, opts.cwd)
+    const child = spawnFor(command, opts.shell, opts.cwd, { detached: true })
 
     let stdout = ''
     let stderr = ''
+    let dropped = 0
     let timedOut = false
     let settled = false
+    let escape: NodeJS.Timeout | undefined
 
     const timer = setTimeout(() => {
       timedOut = true
-      child.kill()
-    }, Math.min(opts.timeoutMs, MAX_TIMEOUT_MS))
+      stop()
+    }, timeoutFrom(opts.timeoutMs))
 
-    const onAbort = () => child.kill()
-    opts.signal?.addEventListener('abort', onAbort, { once: true })
+    const onAbort = () => stop()
+    if (opts.signal?.aborted) queueMicrotask(() => stop())
+    else opts.signal?.addEventListener('abort', onAbort, { once: true })
 
-    child.stdout?.on('data', d => (stdout += String(d)))
-    child.stderr?.on('data', d => (stderr += String(d)))
-    child.on('error', err => {
+    function settle(result: RunResult): void {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      if (escape) clearTimeout(escape)
       opts.signal?.removeEventListener('abort', onAbort)
-      resolve({ code: -1, stdout, stderr: err.message, timedOut })
+      resolve(result)
+    }
+
+    /**
+     * Kills the whole tree and, if the pipes are still held after the grace
+     * period, stops waiting. Whatever survives is reported instead of silently
+     * pinning the turn open forever.
+     */
+    function stop(): void {
+      if (settled || escape) return
+      killTree(child)
+      escape = setTimeout(() => {
+        killTree(child, 'SIGKILL')
+        settle({ code: null, stdout, stderr, timedOut, abandoned: true })
+      }, KILL_GRACE_MS)
+      escape.unref?.()
+    }
+
+    // Decoded across chunk boundaries: a multi-byte character split between two
+    // reads decoded as two replacement characters with `String(chunk)`.
+    const outDecoder = new StringDecoder('utf8')
+    const errDecoder = new StringDecoder('utf8')
+    const collect = (text: string, into: 'out' | 'err'): void => {
+      if (into === 'out') stdout += text
+      else stderr += text
+      const total = stdout.length + stderr.length
+      if (total <= MAX_OUTPUT_CHARS) return
+      // Trim the head of whichever stream is holding the bytes: the end of a
+      // command's output is the part that says how it went.
+      const excess = total - MAX_OUTPUT_CHARS
+      const fromOut = Math.min(excess, stdout.length)
+      stdout = stdout.slice(fromOut)
+      stderr = stderr.slice(excess - fromOut)
+      dropped += excess
+    }
+
+    child.stdout?.on('data', d => collect(outDecoder.write(d as Buffer), 'out'))
+    child.stderr?.on('data', d => collect(errDecoder.write(d as Buffer), 'err'))
+    child.on('error', err => {
+      stdout += outDecoder.end()
+      settle({ code: -1, stdout: head(stdout, dropped), stderr: err.message, timedOut })
     })
     child.on('close', code => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      opts.signal?.removeEventListener('abort', onAbort)
-      resolve({ code, stdout, stderr, timedOut })
+      stdout += outDecoder.end()
+      stderr += errDecoder.end()
+      settle({ code, stdout: head(stdout, dropped), stderr, timedOut })
     })
     child.stdin?.end()
   })
+}
+
+/** Says so when the head was cut, rather than letting it read as the real start. */
+function head(stdout: string, dropped: number): string {
+  return dropped > 0 ? `[dropped ${dropped} chars from the head — the command outran the buffer]\n${stdout}` : stdout
 }
 
 const MISSING_COMMAND =
@@ -129,6 +214,9 @@ function format(result: RunResult, shell: 'posix' | 'powershell'): { text: strin
   if (stdout.trim()) parts.push(stdout.trimEnd())
   if (stderr.trim()) parts.push(`[stderr]\n${stderr.trimEnd()}`)
   if (result.timedOut) parts.push('[timed out]')
+  if (result.abandoned) {
+    parts.push('[killed, but something it started still holds the output pipe — it may still be running]')
+  }
   if (result.code !== 0) parts.push(`[exit code ${result.code}]`)
   const hint = hintFor(result, shell)
   if (hint) parts.push(hint)
@@ -163,7 +251,8 @@ function background(
   shell: 'posix' | 'powershell',
   cwd: string,
 ): { text: string } {
-  const child = spawnFor(command, shell, cwd)
+  // Detached so `KillShell` can take down the whole pipeline, not just the shell.
+  const child = spawnFor(command, shell, cwd, { detached: true })
   const job = startJob(session, { command: oneLineCommand(command), shell, child })
   return {
     text:

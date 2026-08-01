@@ -15,6 +15,12 @@ import { describeError } from '../util/error.ts'
 
 const DEFAULT_THRESHOLD = 0.85
 const DEFAULT_KEEP_TURNS = 4
+/**
+ * Messages kept when a single turn is the whole history and there is no user
+ * turn to cut between. Enough to hold the shape of what is in flight — the last
+ * few calls and their results — without keeping the run that filled the window.
+ */
+const KEEP_MESSAGES_FALLBACK = 20
 const DEFAULT_SUMMARY_TOKENS = 4000
 const CHARS_PER_TOKEN = 4
 
@@ -27,7 +33,12 @@ export type CompactionResult = {
 }
 
 export function estimateTokens(text: string): number {
-  return Math.ceil(text.length / CHARS_PER_TOKEN)
+  return estimateTokensForChars(text.length)
+}
+
+/** The same estimate when only the size is known, without building the string. */
+export function estimateTokensForChars(chars: number): number {
+  return Math.ceil(chars / CHARS_PER_TOKEN)
 }
 
 /**
@@ -39,6 +50,23 @@ export function stripEmptyThinkTags(text: string): string {
   return text.replace(/<think>\s*<\/think>/gi, '').trim()
 }
 
+/**
+ * Image bytes are not text and must not be counted as if they were: a 300 KB
+ * screenshot serialised to JSON reads as ~150k tokens, which would trip
+ * compaction on a session nowhere near full. What a provider actually charges
+ * for an image is closer to a fixed cost, so a flat estimate stands in.
+ */
+const IMAGE_TOKEN_ESTIMATE = 1_600
+
+function imageAsSize(key: string, value: unknown): unknown {
+  if (key !== 'image' && key !== 'data') return value
+  // A Buffer serialises as a byte array; either shape is stopped here.
+  if (typeof value === 'string' || value instanceof Uint8Array || Array.isArray(value)) {
+    return '.'.repeat(IMAGE_TOKEN_ESTIMATE * CHARS_PER_TOKEN)
+  }
+  return value
+}
+
 /** Rough size of a message list. Serialisation cost is close enough for a threshold. */
 export function estimateMessagesTokens(messages: ModelMessage[]): number {
   let chars = 0
@@ -47,7 +75,7 @@ export function estimateMessagesTokens(messages: ModelMessage[]): number {
       chars += message.content.length
     } else {
       try {
-        chars += JSON.stringify(message.content).length
+        chars += JSON.stringify(message.content, imageAsSize).length
       } catch {
         chars += 0
       }
@@ -84,16 +112,37 @@ export function shouldCompact(session: Session): boolean {
 }
 
 /**
- * Index of the first message to keep. Walks back over `keepTurns` real user
- * turns; returns 0 when there is nothing safe to drop.
+ * Index of the first message to keep. Walks back over `keepTurns` user turns;
+ * returns 0 when there is nothing safe to drop.
  */
 export function findCutIndex(messages: ModelMessage[], keepTurns: number): number {
-  const userTurns: number[] = []
+  if (keepTurns < 1) return 0
+  let seen = 0
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === 'user') {
-      userTurns.push(i)
-      if (userTurns.length > keepTurns) return i
-    }
+    if (messages[i].role !== 'user') continue
+    seen++
+    // The `keepTurns`-th user turn from the end is the first one kept. Cutting
+    // one turn later than that kept `keepTurns + 1`, so a configured 2 meant 3.
+    if (seen === keepTurns) return i
+  }
+  return 0
+}
+
+/**
+ * Where to cut when there are not enough user turns to cut between.
+ *
+ * One long agentic turn — a single question that ran fifty tool calls — has one
+ * user message, so the turn-based cut always answered 0 and compaction declined
+ * for the whole run. The session then died on a context-length error from the
+ * provider, which is the outcome compaction exists to prevent. Cutting by
+ * message count instead keeps the last `keepMessages`, moved forward to the
+ * first message that is not a tool result so no result is orphaned from the
+ * call that produced it.
+ */
+export function findFallbackCut(messages: ModelMessage[], keepMessages: number): number {
+  if (messages.length <= keepMessages) return 0
+  for (let i = messages.length - keepMessages; i < messages.length; i++) {
+    if (messages[i].role !== 'tool') return i
   }
   return 0
 }
@@ -154,7 +203,9 @@ export async function compact(
   }
 
   const keepTurns = session.config.compaction?.keepRecentTurns ?? DEFAULT_KEEP_TURNS
-  const cut = findCutIndex(session.messages, keepTurns)
+  const cut =
+    findCutIndex(session.messages, keepTurns) ||
+    findFallbackCut(session.messages, KEEP_MESSAGES_FALLBACK)
   if (cut === 0) {
     return {
       compacted: false,

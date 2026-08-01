@@ -43,13 +43,27 @@ export function buildSystemPrompt(input: SystemPromptInput): string {
     `- Shell: ${input.shell}`,
     `- Model: ${input.model}`,
     ...(input.effort ? [`- Effort: ${input.effort}`] : []),
-    `- Permission mode: ${input.permissionMode}`,
+    // The permission mode is deliberately **not** here. It is the one line in
+    // this prompt that changes mid-session — shift+tab toggles it — and the
+    // system prompt is what the provider's cache breakpoint covers, so every
+    // toggle threw away the whole cached prefix and the next call paid full
+    // price for it. `modeReminder` carries it in the turn instead.
     ...(input.extra ? ['', input.extra] : []),
   ].join('\n')
 }
 
 export function reminder(body: string): string {
   return `<system-reminder>\n${body}\n</system-reminder>`
+}
+
+/**
+ * The current permission mode, as a turn-level note.
+ *
+ * Sent when it changes rather than every turn: it belongs in the conversation,
+ * where a new block costs nothing, instead of in the cached system prefix.
+ */
+export function modeReminder(mode: PermissionMode): string {
+  return reminder(`Permission mode is now: ${mode}`)
 }
 
 export function instructionsBlock(assets: AssetBundle): string | null {

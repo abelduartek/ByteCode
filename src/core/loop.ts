@@ -8,7 +8,7 @@ import { summarize } from './hooks.ts'
 import { maybeCompact } from './compaction.ts'
 import { cachePolicy, cachedSystem, withCacheControl } from './cache.ts'
 import { ThinkFilter } from './reasoning.ts'
-import { bootstrapBlocks, buildSystemPrompt } from './context.ts'
+import { bootstrapBlocks, buildSystemPrompt, modeReminder } from './context.ts'
 import { saveSessionState } from './sessions.ts'
 import { authPath, brokenAuthFiles } from '../provider/auth.ts'
 import { CLI } from '../util/paths.ts'
@@ -69,10 +69,18 @@ type CallResult = {
   isError: boolean
 }
 
+/** An image attached to the user's turn, already decoded. */
+export type TurnImage = { data: Buffer; mediaType: string }
+
 export type TurnOptions = {
   /** Extra `<system-reminder>` blocks for this turn only. */
   extraBlocks?: string[]
   promptId?: string
+  /**
+   * Images pasted with the prompt. They travel as content parts, so the text
+   * stays a plain string whenever there are none — which is almost always.
+   */
+  images?: TurnImage[]
 }
 
 export async function runTurn(
@@ -107,6 +115,12 @@ export async function runTurn(
   }
 
   const blocks: string[] = []
+  // Announced when it changes, since it is no longer in the system prompt: a
+  // line that moves cannot live inside the cached prefix.
+  if (session.announcedMode !== session.mode) {
+    blocks.push(modeReminder(session.mode))
+    session.announcedMode = session.mode
+  }
   if (!session.bootstrapped) {
     blocks.push(
       ...bootstrapBlocks(
@@ -123,11 +137,32 @@ export async function runTurn(
     blocks.push(`<system-reminder>\nUserPromptSubmit hook context:\n${ctx}\n</system-reminder>`)
   }
 
-  const content = [...blocks, userText].join('\n\n')
-  session.messages.push({ role: 'user', content })
+  const promptText = [...blocks, userText].join('\n\n')
+  const images = opts.images ?? []
+  const content = (
+    images.length === 0
+      ? promptText
+      : [
+          { type: 'text', text: promptText },
+          ...images.map(image => ({
+            type: 'image',
+            image: image.data,
+            mediaType: image.mediaType,
+          })),
+        ]
+  ) as ModelMessage['content']
+  session.messages.push({ role: 'user', content } as ModelMessage)
+  // Base64 image bytes would bloat every transcript line and every session
+  // snapshot, so what is recorded is the text plus a note of what came with it.
   session.transcript.append(
     'user',
-    { message: { role: 'user', content }, promptId },
+    {
+      message: { role: 'user', content: promptText },
+      promptId,
+      ...(images.length > 0
+        ? { attachments: images.map(i => ({ mediaType: i.mediaType, bytes: i.data.length })) }
+        : {}),
+    },
     { isSidechain: session.depth > 0, agentId: session.agentType },
   )
 
@@ -150,6 +185,8 @@ export async function runTurn(
           modelRef: session.modelRef,
           messages: session.messages,
           tokenBaseline: session.tokenBaseline,
+          parentId: session.forkedFrom,
+          forkedAtMessage: session.forkedAtMessage,
         })
       } catch (err) {
         session.emit({ type: 'notice', text: `sessão não pôde ser salva: ${describeError(err)}` })
@@ -279,6 +316,24 @@ async function drive(session: Session, promptId: string): Promise<void> {
   })
 }
 
+/**
+ * A turn that ended because the model call failed, not because the model was
+ * done.
+ *
+ * `shown` says the message already reached the user through a `error` event, so
+ * a UI that catches this should not print it a second time — while a subagent or
+ * a workflow step, which has no screen of its own, still learns that its result
+ * is not an answer.
+ */
+export class TurnFailure extends Error {
+  readonly shown: boolean
+  constructor(message: string, opts: { shown: boolean }) {
+    super(message)
+    this.name = 'TurnFailure'
+    this.shown = opts.shown
+  }
+}
+
 type StepOutcome =
   | { ok: true; calls: PendingCall[] }
   /** `emitted` means output already reached the user, so a retry would duplicate it. */
@@ -287,10 +342,27 @@ type StepOutcome =
 /**
  * One model call, retried on transient provider failures.
  *
- * A retry is only safe while nothing has been shown: the failure path leaves
- * `session.messages` untouched, so re-running produces one clean answer instead
- * of a second half of one.
+ * A retry is only safe while nothing has been shown: nothing shown means nothing
+ * was added to `session.messages` either, so re-running produces one clean
+ * answer instead of a second half of one. Once text has reached the user it is
+ * kept — and this stops retrying.
  */
+/**
+ * Whether this session's provider is one that writes reasoning into the content
+ * channel as `<think>` tags. `reasoning.inlineThinkTags` in the config forces it
+ * either way for a provider this guess gets wrong.
+ */
+function usesInlineThinkTags(session: Session): boolean {
+  const configured = session.config.reasoning?.inlineThinkTags
+  if (typeof configured === 'boolean') return configured
+  try {
+    const { provider } = session.resolveModel()
+    return (provider.npm ?? '@ai-sdk/openai-compatible') === '@ai-sdk/openai-compatible'
+  } catch {
+    return true
+  }
+}
+
 async function streamStep(session: Session): Promise<PendingCall[]> {
   for (let attempt = 0; ; attempt++) {
     const outcome = await streamOnce(session)
@@ -304,13 +376,22 @@ async function streamStep(session: Session): Promise<PendingCall[]> {
       isTransient(outcome.failure, outcome.error)
 
     if (!retryable) {
+      // Esc is not a provider failure. The stream rejects with an abort error,
+      // and reporting that verbatim told the user their own interruption was
+      // something going wrong. The partial answer is already in the history.
+      if (session.abort?.signal.aborted) {
+        session.emit({ type: 'notice', text: 'interrompido' })
+        return []
+      }
       const status = (outcome.error as { statusCode?: number })?.statusCode
       const unauthorised = status === 401 || status === 403 || /\b401\b|no api key/i.test(outcome.failure)
-      session.emit({
-        type: 'error',
-        text: unauthorised ? `${outcome.failure}${credentialHint(session)}` : outcome.failure,
-      })
-      return []
+      const text = unauthorised ? `${outcome.failure}${credentialHint(session)}` : outcome.failure
+      session.emit({ type: 'error', text })
+      // Thrown, not swallowed. Returning no calls is how a turn says "the model
+      // is done talking", so a provider that never answered looked exactly like
+      // one that finished: a subagent reported success with empty output, and a
+      // workflow step journaled that as its result.
+      throw new TurnFailure(text, { shown: true })
     }
 
     const wait = retryAfterMs(outcome.error) ?? RETRY_DELAYS_MS[attempt]
@@ -425,7 +506,12 @@ async function streamOnce(session: Session): Promise<StepOutcome> {
   })
 
   const calls: PendingCall[] = []
-  const think = new ThinkFilter()
+  // Only where the problem exists. The proxies that stream reasoning as literal
+  // `<think>` inside the content channel are the OpenAI-compatible ones; a
+  // provider with a real reasoning channel never does it, and filtering there
+  // silently ate the tags out of a legitimate answer — asking an Anthropic model
+  // to explain `<thinking>` blocks returned an answer with the subject removed.
+  const think = new ThinkFilter({ enabled: usesInlineThinkTags(session) })
   let assistantText = ''
   let failure: string | null = null
   let failureError: unknown = null
@@ -503,11 +589,24 @@ async function streamOnce(session: Session): Promise<StepOutcome> {
     session.emit({ type: 'text', text: tail.text })
   }
 
+  /**
+   * Keeps what the user already read.
+   *
+   * The history is only written from the provider's `response`, which a failed
+   * or interrupted stream never produces — so half an answer stayed on screen
+   * while the conversation behaved as if it had never been said. The next turn
+   * then answered a question the user believed was already half answered.
+   */
+  const keepPartial = (): void => {
+    if (assistantText.trim()) session.messages.push({ role: 'assistant', content: assistantText })
+  }
+
   // A failed stream also rejects `response` and `usage`. Both must be consumed
   // or Node tears the process down with an unhandled rejection.
   if (failure !== null) {
     void Promise.resolve(result.response).catch(() => {})
     void Promise.resolve(result.usage).catch(() => {})
+    keepPartial()
     return {
       ok: false,
       failure,
@@ -521,6 +620,7 @@ async function streamOnce(session: Session): Promise<StepOutcome> {
     response = (await result.response) as { messages: unknown[] }
   } catch (err) {
     void Promise.resolve(result.usage).catch(() => {})
+    keepPartial()
     return {
       ok: false,
       failure: describeError(err),
@@ -687,6 +787,13 @@ async function mapWithLimit<T, R>(
  * Requiring the whole batch to be safe — the original rule — meant one Bash
  * anywhere in the list serialised every Read around it.
  */
+/**
+ * Which model call each batch belongs to, per session. Counted here rather than
+ * read off `TurnStats.steps` so it stays unique regardless of where the step
+ * counter happens to be incremented, and so a subagent numbers its own calls.
+ */
+const stepCounter = new WeakMap<Session, number>()
+
 export async function executeCalls(
   session: Session,
   calls: PendingCall[],
@@ -694,12 +801,14 @@ export async function executeCalls(
   memory: TurnMemory = { calls: new Map() },
 ): Promise<CallResult[]> {
   const out: CallResult[] = new Array(calls.length)
+  const step = (stepCounter.get(session) ?? 0) + 1
+  stepCounter.set(session, step)
 
   let i = 0
   while (i < calls.length) {
     const group = groupOf(session, calls[i])
     if (group === null) {
-      out[i] = await executeCall(session, calls[i], promptId, memory)
+      out[i] = await executeCall(session, calls[i], promptId, memory, step)
       i++
       continue
     }
@@ -708,7 +817,7 @@ export async function executeCalls(
     const batch = await mapWithLimit(
       calls.slice(i, end),
       groupLimit(session, group),
-      call => executeCall(session, call, promptId, memory),
+      call => executeCall(session, call, promptId, memory, step),
     )
     for (let k = 0; k < batch.length; k++) out[i + k] = batch[k]
     i = end
@@ -722,6 +831,7 @@ async function executeCall(
   call: PendingCall,
   promptId: string,
   memory: TurnMemory,
+  step: number,
 ): Promise<CallResult> {
   const base = {
     session_id: session.transcript.sessionId,
@@ -871,6 +981,7 @@ async function executeCall(
     name: tool.name,
     summary: summaryText,
     subject,
+    step,
   })
 
   const startedAt = Date.now()

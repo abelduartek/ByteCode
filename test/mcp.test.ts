@@ -333,7 +333,7 @@ console.log('--- o stderr do servidor entra na mensagem de erro ---')
     !enriched.message.includes('Starting Azure DevOps'), enriched.message)
 
   const texto = explainFailure(new Error('x'), 'linha antiga\nfalhou de verdade\n\n')
-  check('funciona com stderr em texto puro', texto.message === 'x — o servidor disse: falhou de verdade', texto.message)
+  check('funciona com stderr em texto puro', texto.message === 'x — the server said: falhou de verdade', texto.message)
 
   const vazio = explainFailure(new Error('x'), '   \n\n')
   check('sem stderr o erro fica intacto', vazio.message === 'x', vazio.message)

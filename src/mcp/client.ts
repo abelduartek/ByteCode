@@ -80,8 +80,31 @@ export function childEnv(cfg: McpServerConfig): Record<string, string> {
       out[key] = value
     }
   }
-  return { ...out, ...(cfg.environment ?? {}) }
+  const merged = { ...out, ...(cfg.environment ?? {}) }
+  if (process.platform !== 'win32') return merged
+
+  // Windows environment variables are case-insensitive, but a plain object is
+  // not: `getDefaultEnvironment()` contributes `PATH` while `process.env`
+  // spells it `Path`, and a config that sets one of them left the other in the
+  // object too. Which one the child saw was up to the OS, so a `PATH` written
+  // to point at a specific toolchain was silently ignored half the time.
+  const folded: Record<string, string> = {}
+  const seen = new Map<string, string>()
+  for (const [key, value] of Object.entries(merged)) {
+    const lower = key.toLowerCase()
+    const existing = seen.get(lower)
+    if (existing !== undefined) delete folded[existing]
+    seen.set(lower, key)
+    folded[key] = value
+  }
+  return folded
 }
+
+/** A stop for a server whose `nextCursor` never ends. */
+const MAX_TOOL_PAGES = 50
+
+/** Environment names that carry a credential, so an empty one is a failure. */
+const SECRET_ENV_NAME = /(KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTH)/i
 
 /** Bytes of server stderr kept for the failure message. */
 const STDERR_TAIL_BYTES = 4096
@@ -128,11 +151,49 @@ export function explainFailure(err: unknown, stderr: string): Error {
     .find(Boolean)
   if (!said) return base
   const trimmed = said.length > STDERR_IN_ERROR ? `${said.slice(0, STDERR_IN_ERROR)}…` : said
-  return new Error(`${base.message} — o servidor disse: ${trimmed}`)
+  return new Error(`${base.message} — the server said: ${trimmed}`)
+}
+
+/**
+ * Splits a command written as one string, respecting quotes.
+ *
+ * `"C:\\Program Files\\node\\node.exe" server.js` is one program and one
+ * argument; split on whitespace it became `C:\Program` with three arguments,
+ * and the server failed to start on the only platform where that path is
+ * normal. Use the array form to avoid the question entirely.
+ */
+export function splitCommand(command: string): string[] {
+  const parts: string[] = []
+  let current = ''
+  let quote: '"' | "'" | null = null
+  let quoted = false
+
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]
+    if (quote) {
+      if (ch === quote) quote = null
+      else current += ch
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      quoted = true
+      continue
+    }
+    if (/\s/.test(ch)) {
+      if (current || quoted) parts.push(current)
+      current = ''
+      quoted = false
+      continue
+    }
+    current += ch
+  }
+  if (current || quoted) parts.push(current)
+  return parts
 }
 
 function asArgv(command: string[] | string): { command: string; args: string[] } {
-  const parts = Array.isArray(command) ? command : command.split(/\s+/).filter(Boolean)
+  const parts = Array.isArray(command) ? command : splitCommand(command)
   if (parts.length === 0) throw new Error('mcp: empty command')
   return { command: parts[0], args: parts.slice(1) }
 }
@@ -241,13 +302,16 @@ export class McpManager {
     // nothing about the actual cause. Named up front instead.
     const entries: [string, McpServerConfig][] = []
     for (const [name, cfg] of enabled) {
+      // Only variables that were *meant* to hold a credential. A server that
+      // legitimately passes an empty value — `NO_COLOR: ""`, a flag whose
+      // presence is the point — was refused as if its credential were missing.
       const blank = Object.entries(cfg.environment ?? {})
-        .filter(([, value]) => value === '')
+        .filter(([key, value]) => value === '' && SECRET_ENV_NAME.test(key))
         .map(([key]) => key)
       if (blank.length > 0) {
         const error =
-          `credencial ausente: ${blank.join(', ')} vazio — a referência {env:…} ou {file:…} ` +
-          `em "environment" não resolveu`
+          `missing credential: ${blank.join(', ')} is empty — the {env:…} or {file:…} reference ` +
+          `in "environment" did not resolve`
         this.failures.push({ name, error })
         onNotice?.(`mcp "${name}": ${error}`)
         continue
@@ -297,20 +361,39 @@ export class McpManager {
       if (!cfg.url) throw new Error('remote server needs "url"')
       const url = new URL(cfg.url)
       const requestInit = cfg.headers ? { headers: cfg.headers } : undefined
+      const streamable = new StreamableHTTPClientTransport(url, { requestInit })
       try {
-        await client.connect(new StreamableHTTPClientTransport(url, { requestInit }), {
-          timeout: timeoutMs,
-        })
-      } catch {
-        // Older servers only speak the HTTP+SSE transport.
-        await client.connect(new SSEClientTransport(url, { requestInit }), {
-          timeout: timeoutMs,
-        })
+        await client.connect(streamable, { timeout: timeoutMs })
+      } catch (streamableError) {
+        // Older servers only speak the HTTP+SSE transport. The failed one is
+        // closed first — left open it kept a socket and a reconnect timer alive
+        // for a transport nothing would ever read again.
+        await streamable.close().catch(() => {})
+        try {
+          await client.connect(new SSEClientTransport(url, { requestInit }), {
+            timeout: timeoutMs,
+          })
+        } catch (sseError) {
+          // Both spoken for: an SSE error alone reads as "this server is not
+          // there", when the real reason is usually in the first attempt.
+          const first = streamableError instanceof Error ? streamableError.message : String(streamableError)
+          const second = sseError instanceof Error ? sseError.message : String(sseError)
+          throw new Error(`streamable HTTP failed (${first}); SSE fallback failed (${second})`)
+        }
       }
     }
 
-    const listed = await client.listTools(undefined, { timeout: timeoutMs })
-    let tools = (listed.tools ?? []) as RemoteTool[]
+    // Every page. `tools/list` is paginated in the protocol, and a server with
+    // more tools than fit in one page had the rest silently missing — a config
+    // could name a tool in `allowedTools` that simply never appeared.
+    let tools: RemoteTool[] = []
+    let cursor: string | undefined
+    for (let page = 0; page < MAX_TOOL_PAGES; page++) {
+      const listed = await client.listTools(cursor ? { cursor } : undefined, { timeout: timeoutMs })
+      tools.push(...((listed.tools ?? []) as RemoteTool[]))
+      cursor = listed.nextCursor
+      if (!cursor) break
+    }
     if (cfg.allowedTools?.length) {
       const allow = new Set(cfg.allowedTools)
       tools = tools.filter(t => allow.has(t.name))

@@ -9,9 +9,67 @@ import { c, diffMark, diffNumber, diffText, em, g, level, strike, strong, tint, 
 const ESC = String.fromCharCode(27)
 const ANSI = new RegExp(`${ESC}\\[[0-9;]*m`, 'g')
 const ANSI_HEAD = new RegExp(`^${ESC}\\[[0-9;]*m`)
+const RESET = `${ESC}[0m`
+
+/**
+ * Any escape sequence, not just the colour ones: CSI with any final byte, OSC
+ * up to its terminator, and the two-character forms.
+ *
+ * Colour is the only kind this UI emits, but the text it *renders* comes from
+ * files, command output and model answers. A `CSI 2J` in a log line used to pass
+ * straight through — counted as three printable characters and then executed by
+ * the terminal, clearing the screen from inside a frame.
+ */
+const ESCAPE_SEQ = new RegExp(
+  `${ESC}(?:\\[[0-9;:?<=>]*[@-~]|\\][^${ESC}]*(?:|${ESC}\\\\)?|[@-Z\\\\-_])`,
+  'g',
+)
 
 export function stripAnsi(text: string): string {
-  return text.replace(ANSI, '')
+  return text.replace(ESCAPE_SEQ, '')
+}
+
+/** Wide (double-column) code points: CJK, Hangul, and the emoji blocks. */
+function isWide(cp: number): boolean {
+  return (
+    (cp >= 0x1100 && cp <= 0x115f) ||
+    (cp >= 0x2e80 && cp <= 0x303e) ||
+    (cp >= 0x3041 && cp <= 0x33ff) ||
+    (cp >= 0x3400 && cp <= 0x4dbf) ||
+    (cp >= 0x4e00 && cp <= 0x9fff) ||
+    (cp >= 0xa000 && cp <= 0xa4cf) ||
+    (cp >= 0xa960 && cp <= 0xa97f) ||
+    (cp >= 0xac00 && cp <= 0xd7a3) ||
+    (cp >= 0xf900 && cp <= 0xfaff) ||
+    (cp >= 0xfe10 && cp <= 0xfe19) ||
+    (cp >= 0xfe30 && cp <= 0xfe6f) ||
+    (cp >= 0xff00 && cp <= 0xff60) ||
+    (cp >= 0xffe0 && cp <= 0xffe6) ||
+    (cp >= 0x1f300 && cp <= 0x1f64f) ||
+    (cp >= 0x1f680 && cp <= 0x1f6ff) ||
+    (cp >= 0x1f900 && cp <= 0x1f9ff) ||
+    (cp >= 0x20000 && cp <= 0x3fffd)
+  )
+}
+
+/** Marks that attach to the previous character and take no column of their own. */
+function isZeroWidth(cp: number): boolean {
+  return (
+    cp === 0x200b ||
+    cp === 0x200d ||
+    cp === 0xfeff ||
+    (cp >= 0x0300 && cp <= 0x036f) ||
+    (cp >= 0x1ab0 && cp <= 0x1aff) ||
+    (cp >= 0x20d0 && cp <= 0x20ff) ||
+    (cp >= 0xfe00 && cp <= 0xfe0f) ||
+    (cp >= 0x1f3fb && cp <= 0x1f3ff)
+  )
+}
+
+/** Columns one code point occupies on screen. */
+function charWidth(cp: number): number {
+  if (isZeroWidth(cp)) return 0
+  return isWide(cp) ? 2 : 1
 }
 
 // Every C0 control **except** ESC (0x1b), which is how each SGR sequence starts.
@@ -29,33 +87,64 @@ const CONTROLS = new RegExp('[\u0000-\u001a\u001c-\u001f\u007f]', 'g')
  * sitting at column 0 — which is exactly what a multi-line Bash command produced.
  */
 export function oneLine(text: string): string {
-  return text.replace(CONTROLS, ' ')
+  // Colour is kept; anything else that an escape sequence could do — move the
+  // cursor, clear the screen, set the window title — is removed rather than
+  // counted as text and handed to the terminal.
+  return text.replace(ESCAPE_SEQ, seq => (seq.endsWith('m') && seq.startsWith(`${ESC}[`) ? seq : ''))
+    .replace(CONTROLS, ' ')
 }
 
+/**
+ * Columns a string occupies on screen.
+ *
+ * Not its length: `.length` counts UTF-16 code units, so an emoji outside the
+ * BMP counted as two and a CJK character as one — the first padded rows too
+ * short and the second too long, and every column after it in the frame was
+ * off by one.
+ */
 export function visibleWidth(text: string): number {
-  return text.replace(ANSI, '').length
+  let width = 0
+  for (const ch of stripAnsi(text)) width += charWidth(ch.codePointAt(0) ?? 0)
+  return width
 }
 
 export function truncate(text: string, width: number): string {
   if (visibleWidth(text) <= width) return text
   const tail = g.ellipsis
-  const budget = width - tail.length
+  const budget = width - visibleWidth(tail)
   if (budget <= 0) return ''
-  let out = ''
+  const { head, open } = takeColumns(text, budget)
+  // A colour opened before the cut has to be closed: the sequence that would
+  // have reset it was in the part that was dropped, so it bled into every row
+  // painted after this one.
+  return head + (open ? RESET : '') + tail
+}
+
+/**
+ * The prefix of `text` that fits in `width` columns, keeping SGR sequences
+ * whole, plus whether a colour is still open at the cut.
+ */
+function takeColumns(text: string, width: number): { head: string; rest: string; open: boolean } {
+  let head = ''
   let count = 0
+  let open = false
   let i = 0
-  while (i < text.length && count < budget) {
+  while (i < text.length) {
     const match = text.slice(i).match(ANSI_HEAD)
     if (match) {
-      out += match[0]
+      head += match[0]
+      open = match[0] !== RESET && match[0] !== `${ESC}[m`
       i += match[0].length
       continue
     }
-    out += text[i]
-    count++
-    i++
+    const ch = String.fromCodePoint(text.codePointAt(i) ?? 0)
+    const w = charWidth(ch.codePointAt(0) ?? 0)
+    if (count + w > width) break
+    head += ch
+    count += w
+    i += ch.length
   }
-  return out + tail
+  return { head, rest: text.slice(i), open }
 }
 
 export function pad(text: string, width: number): string {
@@ -98,10 +187,15 @@ export function wrap(text: string, width: number): string[] {
         lineWidth = 0
       }
       if (wordWidth > width) {
+        // Cut by columns, not by index: slicing the raw string cut through the
+        // middle of an escape sequence, so the tail of it was printed as text
+        // and the colour it opened never closed.
         let rest = word
         while (visibleWidth(rest) > width) {
-          out.push(rest.slice(0, width))
-          rest = rest.slice(width)
+          const piece = takeColumns(rest, width)
+          if (!piece.head) break
+          out.push(piece.head + (piece.open ? RESET : ''))
+          rest = piece.rest
         }
         line = rest
         lineWidth = visibleWidth(rest)
@@ -363,8 +457,19 @@ export function renderMarkdown(text: string, width: number, diff: DiffOptions = 
     if (/^diff --git /.test(line) || /^@@ -\d+(,\d+)? \+\d+(,\d+)? @@/.test(line)) {
       const block: string[] = []
       let j = i
-      while (j < lines.length && DIFF_BODY.test(lines[j])) {
-        block.push(lines[j])
+      while (j < lines.length) {
+        const candidate = lines[j]
+        if (candidate === '') {
+          // A context line inside a hunk is a single space, never empty — so a
+          // truly empty line is the end of the diff, and what follows is prose.
+          // Consuming past it swallowed the bullet list explaining the change,
+          // which was then drawn as grey diff context.
+          const next = lines[j + 1] ?? ''
+          if (!/^(@@ |diff --git |index [0-9a-f])/.test(next)) break
+        } else if (!DIFF_BODY.test(candidate)) {
+          break
+        }
+        block.push(candidate)
         j++
       }
       out.push(...renderDiff(block.join('\n'), width, diff))
@@ -522,7 +627,16 @@ const NUMBERED = /^\s*(\d+) ([+\- ]) ?(.*)$/
 
 const DIFF_FILE = /^diff --git a\/(.+?) b\/(.+)$/
 /** Metadata rows nobody reads: the path is already in the file header. */
-const DIFF_NOISE = /^(index [0-9a-f]|--- |\+\+\+ |new file mode|deleted file mode|old mode|new mode|similarity index|rename (from|to)|Binary files)/
+const DIFF_NOISE = /^(index [0-9a-f]|new file mode|deleted file mode|old mode|new mode|similarity index|rename (from|to)|Binary files)/
+/**
+ * The `--- a/x` / `+++ b/x` pair, which is noise **only before the first hunk**.
+ *
+ * Inside a hunk these are content: deleting the SQL comment `-- x` produces the
+ * row `--- x`, and adding `++ n` produces `+++ n`. Dropping those unconditionally
+ * meant the diff silently omitted real deleted and added lines — the reader had
+ * no way to know something was missing.
+ */
+const DIFF_FILE_MARKER = /^(--- |\+\+\+ )/
 const DIFF_HUNK = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)$/
 
 type DiffRow = { old?: number; now?: number; marker: '+' | '-' | ' '; text: string }
@@ -648,8 +762,13 @@ export function renderDiff(text: string, width: number, opts: DiffOptions = {}):
   const split = opts.layout === 'split' && width >= SPLIT_MIN_WIDTH
   let hint = opts.hint
 
-  // `12 + text` rows come from the file tools, not from git: one number, no hunks.
-  if (lines.some(l => NUMBERED.test(l))) {
+  // `12 + text` rows come from the file tools, not from git: one number, no
+  // hunks. A single line that happens to look like one is not enough — a git
+  // diff whose code contains `  42 + n` was rendered in this mode from top to
+  // bottom, losing every hunk header and every colour the real path gives it.
+  const looksNumbered =
+    !lines.some(l => DIFF_HUNK.test(l) || DIFF_FILE.test(l)) && lines.some(l => NUMBERED.test(l))
+  if (looksNumbered) {
     for (const line of lines) {
       const numbered = line.match(NUMBERED)
       if (!numbered) {
@@ -816,12 +935,15 @@ export function renderDiff(text: string, width: number, opts: DiffOptions = {}):
   let rows: DiffRow[] = []
   let oldNo = 0
   let newNo = 0
+  /** Content only exists inside a hunk; before one, `---`/`+++` are headers. */
+  let inHunk = false
 
   for (const line of lines) {
     const file = line.match(DIFF_FILE)
     if (file) {
       flushRows(rows)
       rows = []
+      inHunk = false
       // `a/x b/y` differ only on a rename, and then both names matter.
       const label = file[1] === file[2] ? file[2] : `${file[1]} → ${file[2]}`
       out.push(rule(width, { label: strong(label), detail: hint, paint: c.accent }))
@@ -830,11 +952,13 @@ export function renderDiff(text: string, width: number, opts: DiffOptions = {}):
       continue
     }
     if (DIFF_NOISE.test(line)) continue
+    if (!inHunk && DIFF_FILE_MARKER.test(line)) continue
 
     const hunk = line.match(DIFF_HUNK)
     if (hunk) {
       flushRows(rows)
       rows = []
+      inHunk = true
       oldNo = Number(hunk[1])
       newNo = Number(hunk[3])
       const span = `${hunk[1]},${hunk[2] ?? '1'} ${g.boxH}${g.boxH}${'>'} ${hunk[3]},${hunk[4] ?? '1'}`

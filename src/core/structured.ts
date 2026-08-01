@@ -30,12 +30,47 @@ export function schemaInstruction(schema: Record<string, unknown>): string {
  * "Here is the JSON you asked for:" no matter how the prompt is worded.
  */
 export function parseStructured(text: string): unknown {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/)
+  // Any fence language, not just `json`: models label the block `jsonc`, `js`,
+  // or nothing at all, and the answer inside is the same either way.
+  const fenced = text.match(/```[A-Za-z0-9_-]*\s*([\s\S]*?)```/)
   const candidate = (fenced ? fenced[1] : text).trim()
   const start = candidate.search(/[{[]/)
   if (start === -1) throw new Error('no JSON found in the response')
+
   const body = candidate.slice(start)
-  return JSON.parse(body)
+  try {
+    return JSON.parse(body)
+  } catch (err) {
+    // Trailing prose — "…} Let me know if you want more detail." — makes the
+    // whole parse fail even though the object itself is complete and correct.
+    // The balanced value is taken and the rest dropped.
+    const balanced = balancedPrefix(body)
+    if (balanced === null) throw err
+    return JSON.parse(balanced)
+  }
+}
+
+/** The first complete JSON value in `text`, or null when it never closes. */
+function balancedPrefix(text: string): string | null {
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') inString = true
+    else if (ch === '{' || ch === '[') depth++
+    else if (ch === '}' || ch === ']') {
+      depth--
+      if (depth === 0) return text.slice(0, i + 1)
+    }
+  }
+  return null
 }
 
 /** What to say to a model that answered with something unparseable. */

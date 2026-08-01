@@ -9,6 +9,8 @@ import { resolvePath } from '../util/fs.ts'
 import { ripgrepPath } from '../util/binaries.ts'
 
 const MAX_READ_LINES = 2000
+/** Files a single `Glob` answers with; the rest are counted, not listed. */
+const GLOB_MAX_RESULTS = 300
 /** Context lines kept on each side of a change in the diff a write reports. */
 const DIFF_CONTEXT = 3
 
@@ -36,7 +38,10 @@ async function readLines(
   const size = await fs.stat(file).then(s => s.size, () => 0)
 
   if (size <= STREAM_THRESHOLD_BYTES) {
-    const lines = (await fs.readFile(file, 'utf8')).split('\n')
+    // `\r` dropped, as the streamed path below already does: leaving it on every
+    // line of a CRLF file means the model quotes it back in an `Edit`, and the
+    // exact-match lookup fails against the same text it was just shown.
+    const lines = (await fs.readFile(file, 'utf8')).split(/\r?\n/)
     return {
       slice: lines.slice(offset - 1, offset - 1 + limit),
       totalLines: lines.length,
@@ -193,17 +198,20 @@ export const writeTool: ToolDefinition = {
     const guard = await guardWrite(ctx.session, file, { whole: true })
     if (!guard.ok) return { text: guard.reason, isError: true }
 
-    const before = (await fs.readFile(file, 'utf8').catch(() => null)) ?? ''
+    // `null` means "did not exist", which is what a revert undoes by deleting the
+    // file. An existing but empty file is not that: reverting a write to one used
+    // to delete a file the user had created.
+    const before = await fs.readFile(file, 'utf8').catch(() => null)
     await fs.mkdir(path.dirname(file), { recursive: true })
     await fs.writeFile(file, content, 'utf8')
 
-    recordChange(ctx.session, { file, before: before === '' ? null : before, after: content })
+    recordChange(ctx.session, { file, before, after: content })
     // The session has now seen this exact content, so the next write is measured
     // against what it just wrote instead of against a stale reading.
     await noteFile(ctx.session, file)
 
     const lines = content.split('\n').length
-    if (!before) {
+    if (before === null) {
       return {
         text: `Created ${lines} line${lines === 1 ? '' : 's'} (${Buffer.byteLength(content)} bytes)`,
         metadata: { file, created: true },
@@ -253,7 +261,13 @@ export const editTool: ToolDefinition = {
         isError: true,
       }
     }
-    const next = input.replace_all ? raw.split(oldStr).join(newStr) : raw.replace(oldStr, newStr)
+    // Replaced through a function, so `$&`, `` $` ``, `$'`, `$1` and `$$` in the
+    // new text stay literal. Passed as a string, `String.replace` reads them as
+    // replacement patterns: writing `const price = '$&'` silently produced the
+    // matched text instead, corrupting the file the edit claimed to fix.
+    const next = input.replace_all
+      ? raw.split(oldStr).join(newStr)
+      : raw.replace(oldStr, () => newStr)
     await fs.writeFile(file, next, 'utf8')
     recordChange(ctx.session, { file, before: raw, after: next })
     await noteFile(ctx.session, file)
@@ -311,7 +325,14 @@ export const globTool: ToolDefinition = {
     const root = abs(String(input.path ?? '.'), ctx.cwd)
     const matches = await globFiles(root, String(input.pattern))
     if (matches.length === 0) return { text: 'No files matched.' }
-    return { text: matches.slice(0, 300).join('\n') }
+    const shown = matches.slice(0, GLOB_MAX_RESULTS)
+    // Said out loud: a silently cut list reads as the whole answer, and
+    // "there are only 300 files like this" is a wrong thing to conclude.
+    const more =
+      matches.length > shown.length
+        ? `\n\n[${matches.length - shown.length} more matched — showing the ${shown.length} most recent]`
+        : ''
+    return { text: shown.join('\n') + more }
   },
 }
 
@@ -337,17 +358,36 @@ async function globFiles(root: string, pattern: string): Promise<string[]> {
   })
 
   // Only the matched set is stat'd, so the cost scales with the answer rather
-  // than with the size of the tree.
-  const withTimes = await Promise.all(
-    matched.map(async file => {
-      try {
-        return { file, mtime: (await fs.stat(file)).mtimeMs }
-      } catch {
-        return { file, mtime: 0 }
-      }
-    }),
-  )
+  // than with the size of the tree — and in bounded batches, because a pattern
+  // that matches every file in a monorepo opened one file handle per match at
+  // once and hit EMFILE.
+  const withTimes = await mapLimit(matched, 64, async file => {
+    try {
+      return { file, mtime: (await fs.stat(file)).mtimeMs }
+    } catch {
+      return { file, mtime: 0 }
+    }
+  })
   return withTimes.sort((a, b) => b.mtime - a.mtime).map(o => o.file)
+}
+
+/** `Promise.all` with a ceiling on how many run at once. */
+async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const out: R[] = new Array(items.length)
+  let next = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const i = next++
+      if (i >= items.length) return
+      out[i] = await fn(items[i])
+    }
+  })
+  await Promise.all(workers)
+  return out
 }
 
 function ripgrepFiles(root: string, pattern: string): Promise<string[] | null> {
@@ -356,6 +396,10 @@ function ripgrepFiles(root: string, pattern: string): Promise<string[] | null> {
 
   return new Promise(resolve => {
     const args = ['--files', '--hidden', '--glob', '!.git/**', '--glob', pattern, root]
+    // Matched the same way as the fallback walk, so which one ran does not
+    // change the answer. An older ripgrep without the flag exits non-zero and
+    // the fallback takes over, which is the same result by another route.
+    if (GLOB_CASE_INSENSITIVE) args.unshift('--glob-case-insensitive')
     let out = ''
     const child = spawn(rg, args, { windowsHide: true })
     child.on('error', () => resolve(null))
@@ -394,7 +438,47 @@ async function walkFiles(root: string): Promise<string[]> {
   return out
 }
 
+/**
+ * Whether a name matches regardless of case, following the filesystem: on Linux
+ * `README` and `readme` are two files, and a pattern that matched both would
+ * return files the caller did not ask for.
+ */
+const GLOB_CASE_INSENSITIVE = process.platform === 'win32' || process.platform === 'darwin'
+
 function globToRegExp(pattern: string): RegExp {
+  return new RegExp(`^${globBody(pattern)}$`, GLOB_CASE_INSENSITIVE ? 'i' : '')
+}
+
+/** The index of the `}` closing the `{` at `from`, or -1. */
+function closingBrace(pattern: string, from: number): number {
+  let depth = 0
+  for (let i = from; i < pattern.length; i++) {
+    if (pattern[i] === '{') depth++
+    else if (pattern[i] === '}' && --depth === 0) return i
+  }
+  return -1
+}
+
+/** Splits `ts,tsx,{a,b}` on the commas that are not inside a nested brace. */
+function splitAlternatives(body: string): string[] {
+  const parts: string[] = []
+  let depth = 0
+  let current = ''
+  for (const ch of body) {
+    if (ch === '{') depth++
+    else if (ch === '}') depth--
+    if (ch === ',' && depth === 0) {
+      parts.push(current)
+      current = ''
+      continue
+    }
+    current += ch
+  }
+  parts.push(current)
+  return parts
+}
+
+function globBody(pattern: string): string {
   let src = ''
   for (let i = 0; i < pattern.length; i++) {
     const c = pattern[i]
@@ -412,9 +496,22 @@ function globToRegExp(pattern: string): RegExp {
       src += '[^/]'
       continue
     }
+    // `**/*.{ts,tsx}` is the ordinary way to write this, and ripgrep already
+    // understands it — so the walk found the files and this filter, reading the
+    // braces as literal characters, threw every one of them away and answered
+    // "No files matched".
+    if (c === '{') {
+      const close = closingBrace(pattern, i)
+      if (close !== -1) {
+        const alternatives = splitAlternatives(pattern.slice(i + 1, close))
+        src += `(?:${alternatives.map(globBody).join('|')})`
+        i = close
+        continue
+      }
+    }
     src += c.replace(/[.+^${}()|[\]\\]/g, '\\$&')
   }
-  return new RegExp(`^${src}$`, 'i')
+  return src
 }
 
 export const grepTool: ToolDefinition = {

@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process'
 import type { HookDefinition, HookMatcherGroup } from '../config/types.ts'
+import { killTree } from './jobs.ts'
 import { ruleMatches, parseRule } from './permissions.ts'
 import type { ToolKind } from './permissions.ts'
 
@@ -145,13 +146,19 @@ export class HookRunner {
     const payload = { ...input, hook_event_name: event } as HookInput
     const results: HookResult[] = []
 
+    // Concurrently: hooks are independent by construction — `summarize` reduces
+    // whatever they return, and the strictest permission decision wins whatever
+    // order they finish in. Run one at a time, three hooks on `PreToolUse` paid
+    // three process spawns in series before every single tool call.
+    const pending: Promise<HookResult>[] = []
     for (const group of groups) {
       if (!matcherMatches(group.matcher, matcherValue)) continue
       for (const hook of group.hooks ?? []) {
         if (!ifMatches(hook.if, payload)) continue
-        results.push(await this.execute(event, hook, payload))
+        pending.push(this.execute(event, hook, payload))
       }
     }
+    results.push(...(await Promise.all(pending)))
     return results
   }
 
@@ -195,7 +202,10 @@ export class HookRunner {
       const timer = setTimeout(() => {
         if (settled) return
         settled = true
-        child.kill()
+        // The tree, not just the shell: a hook that runs `npm test` through
+        // cmd.exe left the whole suite running after the timeout said it had
+        // been stopped.
+        killTree(child, 'SIGKILL')
         resolve({
           hook,
           exitCode: -1,
@@ -220,6 +230,11 @@ export class HookRunner {
         resolve(interpret(event, hook, code ?? 0, stdout, stderr))
       })
 
+      // A hook that never reads stdin makes the write fail with EPIPE, which is
+      // normal and not the hook's problem — but as an unhandled stream error it
+      // became a process-level error and an exit code of 1 for a hook that had
+      // done its job. The `try` alone did not catch it: the write is async.
+      child.stdin?.on('error', () => {})
       try {
         child.stdin?.write(JSON.stringify(payload))
         child.stdin?.end()
@@ -286,6 +301,13 @@ export function summarize(results: HookResult[]): {
   updatedInput?: Record<string, unknown>
   updatedToolOutput?: string
 } {
+  /** deny > ask > allow, the same order the rules in the config are read in. */
+  const RANK = { deny: 3, ask: 2, allow: 1 } as const
+  const outranks = (
+    next: 'allow' | 'deny' | 'ask',
+    current: 'allow' | 'deny' | 'ask' | undefined,
+  ): boolean => current === undefined || RANK[next] > RANK[current]
+
   const contexts: string[] = []
   const blockReasons: string[] = []
   const systemMessages: string[] = []
@@ -309,7 +331,10 @@ export function summarize(results: HookResult[]): {
       stopReason = r.control.stopReason ?? 'stopped by hook'
     }
     const hso = r.control?.hookSpecificOutput
-    if (hso?.permissionDecision) {
+    if (hso?.permissionDecision && outranks(hso.permissionDecision, permission)) {
+      // Strictest wins, not last. Order came from the config file, so a hook
+      // written to block something was silently undone by any later hook that
+      // said `allow` — and the order that decided it was not visible anywhere.
       permission = hso.permissionDecision
       permissionReason = hso.permissionDecisionReason
     }

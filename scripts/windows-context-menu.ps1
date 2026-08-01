@@ -134,6 +134,10 @@ function Build-Command {
   if ($wt) {
     return "`"$($wt.Source)`" -d `"%V`" powershell.exe -NoExit -Command `"$Inner`""
   }
+  # KNOWN LIMITATION: `%V` is substituted by Explorer before PowerShell parses
+  # this, so a folder whose name contains a single quote closes the string and
+  # the command fails to parse. Install Windows Terminal to take the branch
+  # above, which passes the path as an argument instead of interpolating it.
   return "powershell.exe -NoExit -Command `"Set-Location -LiteralPath '%V'; $Inner`""
 }
 

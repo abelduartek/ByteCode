@@ -229,6 +229,35 @@ log('--- permissão: o kind net ---')
       { ...q, subject: 'https://ruim.com/a' }).decision !== 'deny', '')
 }
 
+// Rebinding de DNS: o resolvedor responde público na checagem e loopback na
+// conexão. O resto da suíte usa IP literal, que nem chega a passar pelo DNS —
+// é este caso que prova que a guarda resolve UMA vez e conecta no que passou.
+log('--- rebinding de DNS ---')
+{
+  const dnsModule = await import('node:dns')
+  const real = dnsModule.promises.lookup
+  let calls = 0
+  ;(dnsModule.promises as any).lookup = async (host: string, opts: any) => {
+    if (host !== 'rebind.test') return (real as any)(host, opts)
+    calls++
+    // Primeira resposta pública; da segunda em diante, o servidor local.
+    const address = calls === 1 ? '203.0.113.7' : '127.0.0.1'
+    return opts?.all ? [{ address, family: 4 }] : { address, family: 4 }
+  }
+
+  let leaked = ''
+  try {
+    const outcome = await web.fetchGuarded(new URL(`http://rebind.test:${port}/`), { timeoutMs: 2000 })
+    leaked = (await web.readCapped(outcome.response, 1000)).text
+  } catch {
+    // Conectar no endereço público de documentação não completa — que é o ponto.
+  }
+  ;(dnsModule.promises as any).lookup = real
+
+  check('não alcança o servidor local por rebinding', leaked === '', JSON.stringify(leaked))
+  check('resolve uma vez só e fixa o endereço', calls === 1, String(calls))
+}
+
 log('--- hook if: casa por URL ---')
 {
   const { HookRunner } = await import(`${R}/core/hooks.ts`)

@@ -322,8 +322,11 @@ console.log('--- erro permanente nao repete ---')
 
   mock.reset()
   mock.script.push(mock.failure({ status: 401, message: 'invalid api key' }))
-  await runTurn(session, 'oi')
+  // Falha permanente rejeita o turno; o turno mesmo assim fecha as estatisticas.
+  let rejeitou = false
+  await runTurn(session, 'oi').catch(() => { rejeitou = true })
 
+  check('falha permanente rejeita o turno', rejeitou, '')
   check('401 nao gera retry', session.lastTurn?.retries === 0, String(session.lastTurn?.retries))
   check('chamou o modelo 1 vez', mock.stats.calls === 1, String(mock.stats.calls))
   check('erro chegou ao usuario', errors.some(e => /invalid api key/i.test(e)), JSON.stringify(errors))
@@ -355,7 +358,9 @@ console.log('--- classificacao de erro de rede ---')
       { type: 'error', error },
       { type: 'finish', finishReason: 'error', usage: { inputTokens: {}, outputTokens: {} } },
     ] as never, mock.text('recuperou'))
-    await runTurn(session, 'oi')
+    // Um erro nao transitorio rejeita o turno — o que interessa aqui e se houve
+    // segunda chamada, nao se o turno terminou bem.
+    await runTurn(session, 'oi').catch(() => {})
     const retried = mock.stats.calls > 1
     check(name, retried === expected, `calls=${mock.stats.calls} notices=${notices.length}`)
   }
@@ -373,10 +378,16 @@ console.log('--- nao repete depois de ja ter mostrado texto ---')
     mock.textThenFailure('metade da resp', { status: 503, message: 'overloaded' }),
     mock.text('NAO DEVIA APARECER'),
   )
-  await runTurn(session, 'oi')
+  await runTurn(session, 'oi').catch(() => {})
 
   check('nao repetiu apos saida parcial', mock.stats.calls === 1, String(mock.stats.calls))
   check('nao emitiu a segunda resposta', !out.includes('NAO DEVIA'), JSON.stringify(out))
+  // O que o usuario ja leu continua na historia: sem isso a proxima pergunta e
+  // respondida como se metade da resposta nunca tivesse sido dita.
+  const guardou = session.messages.some(
+    (m: any) => m.role === 'assistant' && String(m.content).includes('metade da resp'),
+  )
+  check('texto parcial fica na historia', guardou, JSON.stringify(session.messages.slice(-2)))
   await session.mcp.close()
 }
 

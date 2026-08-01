@@ -37,8 +37,14 @@ function releasable(buffer: string, tags: string[]): number {
 export class ThinkFilter {
   private inside = false
   private buffer = ''
+  private readonly enabled: boolean
+
+  constructor(opts: { enabled?: boolean } = {}) {
+    this.enabled = opts.enabled !== false
+  }
 
   push(chunk: string): Split {
+    if (!this.enabled) return { text: chunk, reasoning: '' }
     this.buffer += chunk
     let text = ''
     let reasoning = ''

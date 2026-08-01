@@ -27,7 +27,10 @@ export function parseFrontMatter(input: string): FrontMatter {
   const data: Record<string, string | string[]> = {}
   let currentKey: string | null = null
 
-  for (const line of head.split(/\r?\n/)) {
+  // Indexed rather than iterated: a block scalar consumes the lines under it.
+  const headLines = head.split(/\r?\n/)
+  for (let index = 0; index < headLines.length; index++) {
+    const line = headLines[index]
     if (!line.trim() || line.trim().startsWith('#')) continue
 
     // Block list item: `  - value`
@@ -51,6 +54,38 @@ export function parseFrontMatter(input: string): FrontMatter {
       data[key] = []
       continue
     }
+    // `key: |` and `key: >` introduce a block scalar, whose text is the indented
+    // lines under it. Read as an ordinary value, the field became the literal
+    // string "|" — so a multi-line `description:` came out as one character.
+    if (value === '|' || value === '>' || value === '|-' || value === '>-') {
+      const collected: string[] = []
+      let indent: number | null = null
+      while (index + 1 < headLines.length) {
+        const next = headLines[index + 1]
+        if (next.trim() === '') {
+          collected.push('')
+          index++
+          continue
+        }
+        const width = next.length - next.trimStart().length
+        if (indent === null) {
+          // The first non-blank line sets the block's indentation; anything less
+          // indented is the next key, not part of this value.
+          if (width === 0) break
+          indent = width
+        } else if (width < indent) {
+          break
+        }
+        collected.push(next.slice(indent))
+        index++
+      }
+      while (collected.length > 0 && collected[collected.length - 1] === '') collected.pop()
+      const folded = value.startsWith('>')
+        ? collected.join(' ').replace(/\s+/g, ' ').trim()
+        : collected.join('\n')
+      data[key] = folded
+      continue
+    }
     if (value.startsWith('[') && value.endsWith(']')) {
       data[key] = value
         .slice(1, -1)
@@ -70,14 +105,43 @@ export function asString(v: string | string[] | undefined): string | undefined {
   return Array.isArray(v) ? v.join(', ') : v
 }
 
-/** Reads a field that may be written either as a YAML list or `a, b, c`. */
+/**
+ * Reads a field that may be written either as a YAML list or `a, b, c`.
+ *
+ * Splitting happens on commas that separate *entries*, not on commas inside
+ * one: a permission rule like `Bash(git commit -m "a, b")` is a single entry,
+ * and cutting it in half produced two rules that match nothing.
+ */
 export function asList(v: string | string[] | undefined): string[] {
   if (v === undefined) return []
   if (Array.isArray(v)) return v
-  return v
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean)
+
+  const out: string[] = []
+  let current = ''
+  let depth = 0
+  let quote: '"' | "'" | null = null
+  for (const ch of v) {
+    if (quote) {
+      if (ch === quote) quote = null
+      current += ch
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      current += ch
+      continue
+    }
+    if (ch === '(' || ch === '[') depth++
+    if (ch === ')' || ch === ']') depth = Math.max(0, depth - 1)
+    if (ch === ',' && depth === 0) {
+      out.push(current)
+      current = ''
+      continue
+    }
+    current += ch
+  }
+  out.push(current)
+  return out.map(s => s.trim()).filter(Boolean)
 }
 
 function unquote(s: string): string {

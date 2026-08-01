@@ -1,13 +1,23 @@
 import { spawn } from 'node:child_process'
 import path from 'node:path'
-import type { PermissionMode } from '../config/types.ts'
+import { StringDecoder } from 'node:string_decoder'
+import type { PermissionMode, ProviderConfig } from '../config/types.ts'
+import { addModel, addProvider, findConfigTarget, findProviderFile } from '../config/write.ts'
 import type { PermissionRequest, Session, UIEvent } from '../core/session.ts'
-import { runTurn } from '../core/loop.ts'
+import { runTurn, TurnFailure } from '../core/loop.ts'
 import { compact, contextLimit, contextTokens } from '../core/compaction.ts'
 import { formatLeadtime, summarizeTurn } from '../core/leadtime.ts'
 import { formatContextReport } from '../core/contextreport.ts'
-import { formatWhen, listSessions, loadSession, visibleUserText } from '../core/sessions.ts'
-import type { SessionSummary } from '../core/sessions.ts'
+import {
+  flattenTree,
+  formatWhen,
+  listSessions,
+  loadSession,
+  saveSessionState,
+  sessionTree,
+  visibleUserText,
+} from '../core/sessions.ts'
+import type { SessionNode, SessionSummary } from '../core/sessions.ts'
 import type { AgentDefinition, SlashCommand } from '../assets/index.ts'
 import { expandCommandBody } from '../assets/index.ts'
 import { clearParkedAgents, clearTodos, getTodos, resolveAgentModel, todoGroups } from '../tools/meta.ts'
@@ -26,7 +36,19 @@ import { PERMISSION_MODES } from '../core/permissions.ts'
 import { DEFAULT_PRESET, PRESETS, applyTheme, ascii, barLine, c, g, hidden, queued, selected, sparkline, strong } from './theme.ts'
 import { box, gauge, oneLine, pad, renderDiff, renderMarkdown, rule, split, SPLIT_MIN_WIDTH, stripAnsi, truncate, visibleWidth, wrap } from './render.ts'
 import type { DiffLayout } from './render.ts'
-import { copyToClipboard } from '../util/clipboard.ts'
+import { copyToClipboard, readImageFromClipboard } from '../util/clipboard.ts'
+import {
+  AttachmentStore,
+  describeAttachment,
+  expand as expandAttachments,
+  imagePathIn,
+  placeholderFor,
+  readImageFile,
+  shouldFold,
+  userContent,
+} from './attach.ts'
+import type { ImageAttachment } from './attach.ts'
+import { describeError } from '../util/error.ts'
 import { CLI } from '../util/paths.ts'
 
 // Full-screen TUI implementing the ByteCode design spec: centred column capped at
@@ -61,6 +83,16 @@ const PASTE_ON = `${CSI}?2004h`
 const PASTE_OFF = `${CSI}?2004l`
 const PASTE_START = `${CSI}200~`
 const PASTE_END = `${CSI}201~`
+
+/**
+ * How long an `ESC` waits for the rest of its sequence before it is taken to be
+ * the Esc key. Long enough that a sequence split across two reads is reassembled,
+ * short enough that pressing Esc still feels immediate.
+ */
+const ESC_HOLD_MS = 40
+
+/** Narrowest column the layout draws; anything less has no room for a row. */
+const MIN_WIDTH = 40
 
 /** Enter alone submits; these all insert a line break instead. */
 const NEWLINE_KEYS = new Set([
@@ -129,10 +161,19 @@ type Block =
       subject?: string
       detail?: string
       status: 'running' | 'ok' | 'fail'
+      /**
+       * The tool call this line belongs to. Read-group tools run in parallel, so
+       * two `Read` calls are in flight at once routinely; closing "the last
+       * running block with this name" attached each result to whichever of them
+       * happened to be started last.
+       */
+      callId?: string
       preview?: string
       expanded?: boolean
       /** Set on a finished `Agent` call: clicking the line opens that session. */
       agentId?: string
+      /** Model call that asked for it; calls sharing one are drawn as one line. */
+      step?: number
     }
   | { kind: 'notice'; text: string }
   | { kind: 'error'; text: string }
@@ -200,6 +241,22 @@ const HOME_PANEL_MAX = 72
 
 type PickerItem = { label: string; value: string; hint?: string }
 
+/**
+ * One row of a `form` modal. `placeholder` doubles as the default: a field left
+ * empty yields it, so the common provider can be added by pressing enter through
+ * the form instead of retyping what the harness already assumes.
+ */
+type FormField = {
+  name: string
+  label: string
+  value: string
+  placeholder?: string
+  hint?: string
+  masked?: boolean
+  /** Blank is rejected and the field cannot be skipped past on submit. */
+  required?: boolean
+}
+
 /** A cell on screen. Both are 1-based, matching what SGR mouse reports send. */
 type Point = { row: number; col: number }
 
@@ -256,11 +313,24 @@ type Modal =
       masked: boolean
       resolve: (value: string | null) => void
     }
+  | {
+      kind: 'form'
+      title: string
+      detail?: string
+      footer?: string
+      fields: FormField[]
+      index: number
+      /** Set by validation, shown under the fields until the next keystroke. */
+      error?: string
+      resolve: (values: Record<string, string> | null) => void
+    }
   | { kind: 'busy'; title: string; message: string }
   /** Read-only list of what the model broke the work into. */
   | { kind: 'tasks' }
   /** Read-only list of MCP servers and what each one exposes. */
   | { kind: 'mcp' }
+  /** Fork tree of this project sessions; enter opens the highlighted one. */
+  | { kind: 'sessionTree'; roots: SessionNode[]; index: number }
   /** Live progress of the workflow runs, plus the scripts saved on disk. */
   | { kind: 'workflows'; saved: SavedWorkflow[] }
   | null
@@ -270,6 +340,8 @@ const BUILTIN_COMMANDS: { name: string; hint: string }[] = [
   { name: 'model', hint: 'troca o modelo' },
   { name: 'models', hint: 'lista os modelos' },
   { name: 'connect', hint: 'adiciona um provider de LLM' },
+  { name: 'add-provider', hint: 'declara um provider novo na config (modal)' },
+  { name: 'add-model', hint: 'adiciona um modelo a um provider existente' },
   { name: 'disconnect', hint: 'remove uma credencial' },
   { name: 'auth', hint: 'lista as conexões' },
   { name: 'mode', hint: 'modo de permissão' },
@@ -281,6 +353,8 @@ const BUILTIN_COMMANDS: { name: string; hint: string }[] = [
   { name: 'changes', hint: 'arquivos alterados na sessão (ctrl+g)' },
   { name: 'rewind', hint: 'desfaz um arquivo alterado — mesma tela, tecla r' },
   { name: 'resume', hint: 'volta para uma sessão anterior' },
+  { name: 'fork', hint: 'continua daqui numa sessão nova (ctrl+s vê a árvore)' },
+  { name: 'tree', hint: 'árvore de sessões e forks (ctrl+s)' },
   { name: 'sessions', hint: 'lista as sessões deste projeto' },
   { name: 'context', hint: 'uso da janela de contexto' },
   { name: 'context-all', hint: 'detalha o contexto: setup, skills, mcp, tools' },
@@ -378,6 +452,8 @@ export async function runFullscreenTui(
   const history: string[] = []
 
   let input = ''
+  /** What was being typed before the history was walked into. */
+  let draft = ''
   let historyIndex = -1
   let scroll = 0
   let busy = false
@@ -401,12 +477,28 @@ export async function runFullscreenTui(
   let selection: { anchor: Point; head: Point } | null = null
   let selecting = false
   let pasting = false
+  /**
+   * Bracketed paste arrives as a burst of key events. They are collected here
+   * instead of going straight into the composer, so the whole paste can be
+   * measured *before* anything is drawn — a 4000-line log used to be appended
+   * one character at a time, redrawing the screen for each one.
+   */
+  let pasteBuffer = ''
+  /** An escape sequence the last stdin read cut in half. */
+  let pendingKeys = ''
+  let pendingKeyTimer: NodeJS.Timeout | undefined
+  const keyDecoder = new StringDecoder('utf8')
+  const attachments = new AttachmentStore()
   let busySince = 0
   let busyChars = 0
   let busyTokens = 0
   let verbSeed = Math.floor(Math.random() * WORKING_VERBS.length)
   let tipSeed = Math.floor(Math.random() * TIPS.length)
   let liveAssistant: Block | null = null
+  /** Body rows the last frame had, so a scrolled-back view can stay anchored. */
+  let lastViewportTotal = 0
+  /** Points kept for the context sparkline; it draws the last seven. */
+  const MAX_USAGE_TRAIL = 64
   const usageTrail: number[] = []
   /**
    * Every subagent of this session, running and finished. Kept past the end of
@@ -454,10 +546,33 @@ export async function runFullscreenTui(
   })
   const startedAt = Date.now()
 
+  /**
+   * A new block does not move the view.
+   *
+   * `scroll` is the distance from the bottom, so a reader who has not scrolled
+   * is already following the tail and needs nothing done. One who *has* scrolled
+   * back was yanked to the bottom by every arriving block — which, during a
+   * streaming turn, made the scrollback impossible to read at all. Jumping to
+   * the bottom is what the explicit `scroll = 0` on submit and ctrl+end is for.
+   */
   function push(block: Block): void {
     blocks.push(block)
-    scroll = 0
     dirty = true
+  }
+
+  /**
+   * Runs a handler whose result nobody awaits, reporting a failure instead of
+   * letting it escape.
+   *
+   * A rejected promise from a key handler reached the process-level handler,
+   * which writes a stack trace to stderr — straight over the alt screen, with
+   * the frame differ still believing it knows what is on it.
+   */
+  function detach(work: () => Promise<unknown>): void {
+    work().catch((err: unknown) => {
+      push({ kind: 'error', text: describeError(err) })
+      dirty = true
+    })
   }
 
   const say = (text: string) => push({ kind: 'notice', text })
@@ -552,7 +667,7 @@ export async function runFullscreenTui(
       if (index < 0) return false
       homeIndex = index
       dirty = true
-      void resumeSession(home.sessions[index].id)
+      detach(() => resumeSession(home.sessions[index].id))
       return true
     }
 
@@ -611,11 +726,13 @@ export async function runFullscreenTui(
   // ---------------------------------------------------------------- rendering
 
   function layout(): { cols: number; rows: number; width: number; indent: string } {
-    const cols = Math.max(40, out.columns ?? 80)
+    const cols = Math.max(MIN_WIDTH, out.columns ?? 80)
     const rows = Math.max(12, out.rows ?? 24)
     // Fill the terminal by default; a configured cap centres the column instead.
+    // The cap has the same floor as the terminal: a column narrower than this
+    // holds no readable row, and a config file could ask for one.
     const cap = session.config.ui?.maxWidth
-    const width = cap && cap > 0 ? Math.min(cols, cap) : cols
+    const width = cap && cap > 0 ? Math.min(cols, Math.max(MIN_WIDTH, cap)) : cols
     const indent = ' '.repeat(Math.max(0, Math.floor((cols - width) / 2)))
     return { cols, rows, width, indent }
   }
@@ -756,6 +873,13 @@ export async function runFullscreenTui(
     const changes = changedFiles(session).length
     const changed = changes > 0 ? c.faint('ctrl+g ') + c.meta(`alterações(${changes})`) + c.faint(` ${g.sep} `) : ''
 
+    // "Onde estou" tem de estar visível sem abrir nada: numa sessão raiz isto
+    // diz (main); num fork, o id curto — que é o que distingue duas telas com a
+    // mesma conversa até o ponto da bifurcação.
+    const sessionLabel = session.forkedFrom
+      ? c.warn(`fork(#${session.transcript.sessionId.slice(0, 8)})`)
+      : c.faint('(main)')
+
     const left =
       c.faint('shift+tab ') +
       paintMode(session.mode) +
@@ -769,6 +893,9 @@ export async function runFullscreenTui(
       changed +
       c.faint('ctrl+p ') +
       mcpLabel +
+      c.faint(` ${g.sep} `) +
+      c.faint('ctrl+s ') +
+      sessionLabel +
       c.faint(` ${g.sep} `) +
       c.dim('ctx ') +
       pct +
@@ -814,7 +941,9 @@ export async function runFullscreenTui(
           block.expanded ? 1 : 0
         }|${focusedTool !== null && blocks[focusedTool] === block ? 1 : 0}|${
           block.preview?.length ?? 0
-        }|${block.status === 'running' ? frame : 0}|${fold ? `${fold.last ? 'l' : 'h'}${fold.count}` : ''}`
+        }|${(fold?.status ?? block.status) === 'running' ? frame : 0}|${
+          fold ? `${fold.last ? 'l' : 'h'}${fold.count}${fold.status ?? ''}${fold.label ?? ''}` : ''
+        }`
       }
       case 'notice':
         return `n|${width}|${block.text.length}`
@@ -839,34 +968,146 @@ export async function runFullscreenTui(
   /** Consecutive calls to the same tool from which the list starts folding. */
   const FOLD_FROM = 4
 
-  /**
-   * A run of consecutive calls to the same tool, shown as one line.
-   *
-   * A model hunting for a file fires eight `Glob`s in a row; printing eight
-   * lines that all say "No files matched" buries the one thing that mattered.
-   * The blocks are kept as they are — only the drawing folds — so `ctrl+r` still
-   * reaches any single call.
-   *
-   * The fold breaks as soon as one of them is focused or expanded: someone
-   * looking inside the run wants to see the run.
-   */
-  function foldOf(block: Block, list: Block[] = blocks): { last: boolean; count: number } | null {
-    if (block.kind !== 'tool') return null
-    const at = list.indexOf(block)
-    if (at === -1) return null
+  type Fold = {
+    last: boolean
+    count: number
+    /** Present on a batch fold: the sentence that replaces `Name(subject)`. */
+    label?: string
+    /** Outcome of the whole batch, when the fold covers one. */
+    status?: 'running' | 'ok' | 'fail'
+  }
 
+  /**
+   * Extent of a run of tool blocks around `at`, under a predicate on neighbours.
+   */
+  function runAround(
+    list: Block[],
+    at: number,
+    same: (a: Extract<Block, { kind: 'tool' }>) => boolean,
+  ): { start: number; end: number } {
     let start = at
     while (start > 0) {
       const prev = list[start - 1]
-      if (prev.kind !== 'tool' || prev.name !== block.name) break
+      if (prev.kind !== 'tool' || !same(prev)) break
       start--
     }
     let end = at
     while (end + 1 < list.length) {
       const next = list[end + 1]
-      if (next.kind !== 'tool' || next.name !== block.name) break
+      if (next.kind !== 'tool' || !same(next)) break
       end++
     }
+    return { start, end }
+  }
+
+  /** Someone is looking inside this run, so it stays open. */
+  function opened(list: Block[], start: number, end: number): boolean {
+    for (let i = start; i <= end; i++) {
+      const b = list[i]
+      if (b.kind !== 'tool') continue
+      if (b.expanded) return true
+      if (list === blocks && focusedTool !== null && blocks[focusedTool] === b) return true
+    }
+    return false
+  }
+
+  /**
+   * How a batch of calls is described in one line. The model fired them in a
+   * single decision, so they read as one action: "buscando 1 padrão, lendo 3
+   * arquivos e rodando 1 comando".
+   */
+  const BATCH_WORDS: Record<string, { verb: string; one: string; many: string }> = {
+    Grep: { verb: 'buscando', one: 'padrão', many: 'padrões' },
+    Glob: { verb: 'procurando', one: 'arquivo', many: 'arquivos' },
+    Read: { verb: 'lendo', one: 'arquivo', many: 'arquivos' },
+    LS: { verb: 'listando', one: 'diretório', many: 'diretórios' },
+    Bash: { verb: 'rodando', one: 'comando', many: 'comandos' },
+    BashOutput: { verb: 'lendo', one: 'job', many: 'jobs' },
+    Write: { verb: 'escrevendo', one: 'arquivo', many: 'arquivos' },
+    Edit: { verb: 'editando', one: 'arquivo', many: 'arquivos' },
+    WebFetch: { verb: 'buscando', one: 'página', many: 'páginas' },
+    TodoWrite: { verb: 'atualizando', one: 'task', many: 'tasks' },
+    Agent: { verb: 'rodando', one: 'subagente', many: 'subagentes' },
+  }
+
+  function batchLabel(names: string[]): string {
+    // Order of first appearance: it is the order the model wrote the calls in,
+    // and reordering would invent a sequence that never happened.
+    const counted: { name: string; n: number }[] = []
+    for (const name of names) {
+      const seen = counted.find(c => c.name === name)
+      if (seen) seen.n++
+      else counted.push({ name, n: 1 })
+    }
+    const parts = counted.map(({ name, n }) => {
+      const words = BATCH_WORDS[name]
+      // An MCP tool or anything else unknown keeps its own name: inventing a
+      // verb for it would describe the wrong thing.
+      if (!words) return n === 1 ? name : `${n} × ${name}`
+      return `${words.verb} ${n} ${n === 1 ? words.one : words.many}`
+    })
+    if (parts.length === 1) return parts[0]
+    return `${parts.slice(0, -1).join(', ')} e ${parts[parts.length - 1]}`
+  }
+
+  /**
+   * One line in place of several, in two shapes.
+   *
+   * **Batch** — calls the model asked for in the *same* step. It decided once,
+   * so it reads as one action, and it folds while still running: watching four
+   * lines appear and then collapse is worse than one line that was always one.
+   *
+   * **Run** — consecutive calls to the same tool across *different* steps. A
+   * model hunting for a file fires eight `Glob`s one after another, each after
+   * seeing the last result; eight lines saying "No files matched" bury the one
+   * thing that mattered.
+   *
+   * The blocks are kept as they are — only the drawing folds — so `ctrl+r` still
+   * reaches any single call, and the fold breaks as soon as one is focused or
+   * expanded: someone looking inside the run wants to see the run.
+   */
+  /**
+   * `list.indexOf(block)`, without the scan.
+   *
+   * `foldOf` runs for every tool block of every frame, and the frame is rebuilt
+   * on every streamed chunk — so a linear search per block made drawing a long
+   * transcript quadratic in the number of blocks, at exactly the moment the
+   * transcript is longest and the UI busiest.
+   */
+  let indexedList: Block[] | null = null
+  let indexedAt = new Map<Block, number>()
+
+  function indexIn(list: Block[], block: Block): number {
+    if (indexedList !== list || indexedAt.size !== list.length) {
+      indexedAt = new Map(list.map((b, i) => [b, i] as const))
+      indexedList = list
+    }
+    return indexedAt.get(block) ?? -1
+  }
+
+  function foldOf(block: Block, list: Block[] = blocks): Fold | null {
+    if (block.kind !== 'tool') return null
+    const at = indexIn(list, block)
+    if (at === -1) return null
+
+    if (block.step !== undefined) {
+      const step = block.step
+      const { start, end } = runAround(list, at, b => b.step === step)
+      const count = end - start + 1
+      if (count >= 2 && !opened(list, start, end)) {
+        const members = list.slice(start, end + 1) as Extract<Block, { kind: 'tool' }>[]
+        // The whole batch carries one outcome: still going, or something in it
+        // failed, or all of it worked.
+        const status = members.some(b => b.status === 'running')
+          ? ('running' as const)
+          : members.some(b => b.status === 'fail')
+            ? ('fail' as const)
+            : ('ok' as const)
+        return { last: at === end, count, label: batchLabel(members.map(b => b.name)), status }
+      }
+    }
+
+    const { start, end } = runAround(list, at, b => b.name === block.name)
     const count = end - start + 1
     // Judgement call, stated as one: the value of a line per call falls as the
     // run grows. Three `Read`s of three files are a narrative — which files were
@@ -877,10 +1118,11 @@ export async function runFullscreenTui(
     for (let i = start; i <= end; i++) {
       const b = list[i]
       if (b.kind !== 'tool') continue
-      // Still running, opened, or under the cursor: show them all.
-      if (b.status === 'running' || b.expanded) return null
-      if (list === blocks && focusedTool !== null && blocks[focusedTool] === b) return null
+      // A run spans several model calls, so one of them is still in flight while
+      // the rest are done: folding then would hide the only live line.
+      if (b.status === 'running') return null
     }
+    if (opened(list, start, end)) return null
     // The *last* block draws the fold, not the first: `ctrl+r` with nothing
     // focused acts on the last expandable tool, so this way the line you see and
     // the line the key acts on are the same block.
@@ -1096,7 +1338,15 @@ export async function runFullscreenTui(
     if (matches.length === 0) {
       return [c.faint(`  nenhuma sessão casa com "${homeFilter()}"`)]
     }
-    return matches.slice(0, limit).map((s, i) => {
+    // The window follows the selection. Fixed at the first `limit` rows, the
+    // highlight vanished as soon as `↓` walked past the last visible one — and
+    // enter then opened a session that was not on screen.
+    const start =
+      homeIndex < limit
+        ? 0
+        : Math.max(0, Math.min(homeIndex - limit + 1, Math.max(0, matches.length - limit)))
+    return matches.slice(start, start + limit).map((s, offset) => {
+      const i = start + offset
       const active = i === homeIndex
       const marker = active ? c.accent(`${g.prompt} `) : '  '
       const id = c.faint(`#${s.short}`)
@@ -1199,6 +1449,13 @@ export async function runFullscreenTui(
       total += gapBefore(i) + lines.length
     }
 
+    // Anchored while scrolled back: `scroll` counts rows from the bottom, so
+    // rows arriving below would slide the window down and carry the passage
+    // being read off the top. Growing it by the same amount keeps the reader on
+    // the same rows while the turn streams underneath.
+    if (scroll > 0 && total > lastViewportTotal) scroll += total - lastViewportTotal
+    lastViewportTotal = total
+
     maxScroll = Math.max(0, total - height)
     if (scroll > maxScroll) scroll = maxScroll
 
@@ -1295,11 +1552,13 @@ export async function runFullscreenTui(
         if (fold && !fold.last) return []
 
         // One dot carries the outcome: green done, red failed, spinner running.
-        // A separate check plus a dot said the same thing twice.
+        // A separate check plus a dot said the same thing twice. A batch answers
+        // for all of its calls, so it uses the outcome of the whole batch.
+        const status = fold?.status ?? block.status
         const mark =
-          block.status === 'running'
+          status === 'running'
             ? c.info(g.spinner[spinner % g.spinner.length])
-            : block.status === 'ok'
+            : status === 'ok'
               ? c.ok(g.dotOn)
               : c.danger(g.dotOn)
 
@@ -1310,7 +1569,13 @@ export async function runFullscreenTui(
         const shown = subject
           ? `${strong(block.name)}${c.dim(`(${truncate(subject, Math.max(12, width - 34))})`)}`
           : strong(block.name)
-        const title = fold ? `${shown} ${c.faint(`${g.sep} ${fold.count} chamadas`)}` : shown
+        // A batch was one decision, so it gets one sentence instead of the name
+        // of whichever call happened to be last.
+        const title = fold?.label
+          ? `${c.fg(truncate(fold.label, Math.max(20, width - 16)))}${status === 'running' ? c.dim('…') : ''}`
+          : fold
+            ? `${shown} ${c.faint(`${g.sep} ${fold.count} chamadas`)}`
+            : shown
         const focused = focusedTool !== null && blocks[focusedTool] === block
         const right = block.preview
           ? focused
@@ -1501,6 +1766,12 @@ export async function runFullscreenTui(
             : undefined,
       }),
     )
+
+    // What the placeholders in the line stand for. Without this the composer
+    // shows `[Image #1]` and nothing says whether anything was actually read.
+    for (const attachment of attachments.live(input)) {
+      lines.push(c.faint(`   ${g.sep} ${describeAttachment(attachment)}`))
+    }
     return lines
   }
 
@@ -1541,6 +1812,36 @@ export async function runFullscreenTui(
         ` ${c.info(g.prompt)} ${c.fg(truncate(shown, inner - 4))}${blinkOn ? c.info(g.cursor) : ' '}`,
         '',
         ` ${c.faint(current.footer ?? 'enter confirma · esc cancela')}`,
+      ]
+    } else if (current.kind === 'form') {
+      title = c.info(strong(current.title))
+      // The whole form stays on screen, unlike the chain of single-value prompts
+      // `/connect` uses: filling one field is a decision made in view of the
+      // others, and fixing a typo two rows up must not mean starting over.
+      const labelWidth = Math.max(...current.fields.map(f => f.label.length))
+      lines = [
+        ...(current.detail ? [` ${c.faint(current.detail)}`, ''] : []),
+        ...current.fields.flatMap((field, i) => {
+          const active = i === current.index
+          const shown = field.masked ? '•'.repeat(field.value.length) : field.value
+          const label = pad(field.label, labelWidth)
+          const body = shown ? c.fg(shown) : c.faint(field.placeholder ?? '')
+          const caret = active && blinkOn ? c.info(g.cursor) : ' '
+          const marker = active ? c.info(`${g.prompt} `) : '  '
+          const required = field.required ? c.danger('*') : ' '
+          const row = pad(
+            truncate(`${marker}${active ? strong(label) : c.dim(label)} ${required} ${body}${caret}`, inner),
+            inner,
+          )
+          // The hint belongs to the field being edited; showing every hint at
+          // once buries the fields under their own documentation.
+          return active && field.hint
+            ? [selected(row), `   ${c.faint(truncate(field.hint, inner - 4))}`]
+            : [row]
+        }),
+        '',
+        ...(current.error ? [` ${c.danger(truncate(current.error, inner - 2))}`, ''] : []),
+        ` ${c.faint(current.footer ?? 'tab/↑↓ move · enter avança, no último salva · esc cancela')}`,
       ]
     } else if (current.kind === 'busy') {
       title = c.info(strong(current.title))
@@ -1631,6 +1932,56 @@ export async function runFullscreenTui(
               return rows
             })
       lines.push('', ` ${c.faint('esc ou ctrl+p fecha · /context-all detalha o contexto')}`)
+    } else if (current.kind === 'sessionTree') {
+      const rows = flattenTree(current.roots)
+      const forks = rows.filter(r => r.depth > 0).length
+      paint = c.meta
+      title = c.meta(
+        strong(`sessões ${g.sep} ${rows.length}`) +
+          (forks > 0 ? c.faint(` ${g.sep} ${forks} fork${forks === 1 ? '' : 's'}`) : ''),
+      )
+
+      if (rows.length === 0) {
+        lines = [` ${c.faint('nenhuma sessão salva neste projeto ainda')}`]
+      } else {
+        // A janela acompanha a seleção, como no picker: uma árvore de trinta
+        // sessões não cabe, e cortar sempre o fim esconderia justamente o fork
+        // recém-criado, que fica embaixo.
+        const room = Math.max(4, Math.min(14, height - 10))
+        const start = Math.max(0, Math.min(current.index - Math.floor(room / 2), rows.length - room))
+        const visible = rows.slice(Math.max(0, start), Math.max(0, start) + room)
+
+        lines = visible.map(node => {
+          const active = rows[current.index]?.id === node.id
+          const here = node.id === session.transcript.sessionId
+          // O recuo é o que faz a hierarquia ser legível de relance; o `└─` marca
+          // que aquela linha pende da de cima.
+          const indent = node.depth === 0 ? '' : `${'  '.repeat(node.depth - 1)}${g.treeEnd} `
+          const badge = node.depth === 0 ? c.meta('(main)') : c.faint(`(fork${node.forkedAtMessage !== undefined ? ` @${node.forkedAtMessage}` : ''})`)
+          // "onde estou" tem de ser visível sem precisar contar: é a pergunta que
+          // faz alguém abrir esta tela.
+          const mark = here ? c.ok(g.dotOn) : active ? c.info(g.prompt) : ' '
+          const name = here ? c.ok(strong(node.title)) : active ? strong(node.title) : c.fg(node.title)
+          const row = pad(
+            split(
+              ` ${mark} ${c.faint(`#${node.short}`)} ${indent}${truncate(name, Math.max(8, inner - 34))} ${badge}`,
+              `${c.faint(formatWhen(node.updated))} `,
+              inner,
+            ),
+            inner,
+          )
+          return active ? selected(row) : row
+        })
+
+        if (start > 0) lines.unshift(` ${c.faint(`… ${start} acima`)}`)
+        const below = rows.length - (Math.max(0, start) + room)
+        if (below > 0) lines.push(` ${c.faint(`… ${below} abaixo`)}`)
+      }
+
+      lines.push(
+        '',
+        ` ${c.faint('↑↓ move · enter abre · /fork cria um fork daqui · esc ou ctrl+s fecha')}`,
+      )
     } else if (current.kind === 'workflows') {
       const runs = workflowRuns(session)
       const run = runs.at(-1)
@@ -1804,11 +2155,30 @@ export async function runFullscreenTui(
    * per frame, and a Windows console cannot absorb that 30 times a second.
    * During streaming this usually writes one or two lines.
    */
+  /**
+   * A frame that cannot be built must not take the session down with it.
+   *
+   * `draw` runs from the ticker and from every keystroke, so an exception
+   * escaping here reaches the process-level handler, which prints a stack trace
+   * straight over the alt screen — on every tick, forever, with the frame never
+   * repainting again. Painting the error on the last row instead keeps the UI
+   * usable, which is what lets the user undo whatever caused it.
+   */
   function draw(): void {
     if (!dirty) return
     dirty = false
     lastDraw = Date.now()
+    try {
+      paint()
+    } catch (err) {
+      previousFrame = []
+      const { rows, cols } = layout()
+      const row = truncate(c.danger(`render error: ${describeError(err)}`), cols)
+      out.write(`${CSI}${rows};1H${row}${RESET}${CLEAR_LINE}`)
+    }
+  }
 
+  function paint(): void {
     const next = frameLines()
     if (selection) {
       const { start, end, empty } = spanOf(selection)
@@ -1895,6 +2265,30 @@ export async function runFullscreenTui(
     })
   }
 
+  /**
+   * Multi-field modal. Resolves with every field keyed by `name`, or null when
+   * cancelled — a blank field yields its placeholder, so the defaults the
+   * harness already assumes do not have to be retyped.
+   */
+  function askForm(
+    title: string,
+    fields: FormField[],
+    opts: { detail?: string; footer?: string } = {},
+  ): Promise<Record<string, string> | null> {
+    return new Promise(resolve => {
+      modal = {
+        kind: 'form',
+        title,
+        detail: opts.detail,
+        footer: opts.footer,
+        fields,
+        index: 0,
+        resolve,
+      }
+      dirty = true
+    })
+  }
+
   async function withBusyModal<T>(title: string, message: string, work: () => Promise<T>): Promise<T> {
     modal = { kind: 'busy', title, message }
     dirty = true
@@ -1918,7 +2312,6 @@ export async function runFullscreenTui(
         }
         liveAssistant.text += event.text
         busyChars += event.text.length
-        scroll = 0
         dirty = true
         break
       case 'reasoning':
@@ -1938,6 +2331,8 @@ export async function runFullscreenTui(
           summary: event.summary,
           subject: event.subject,
           status: 'running',
+          callId: event.id,
+          step: event.step,
         })
         break
       case 'tool-end': {
@@ -1960,14 +2355,17 @@ export async function runFullscreenTui(
           dirty = true
           break
         }
+        // Matched by call id. The name is only a fallback, for a block pushed
+        // before ids were carried — two parallel `Read`s otherwise swap results,
+        // and the transcript shows one file's content under the other's name.
         for (let i = blocks.length - 1; i >= 0; i--) {
           const b = blocks[i]
-          if (b.kind === 'tool' && b.status === 'running' && b.name === event.name) {
-            b.status = event.ok ? 'ok' : 'fail'
-            b.preview = event.preview
-            b.detail = summarisePreview(event.preview)
-            break
-          }
+          if (b.kind !== 'tool' || b.status !== 'running') continue
+          if (b.callId ? b.callId !== event.id : b.name !== event.name) continue
+          b.status = event.ok ? 'ok' : 'fail'
+          b.preview = event.preview
+          b.detail = summarisePreview(event.preview)
+          break
         }
         dirty = true
         break
@@ -1992,6 +2390,9 @@ export async function runFullscreenTui(
         if (event.input) {
           const limit = contextLimit(session)
           usageTrail.push(limit ? Math.min(1, event.input / limit) : 0)
+          // The sparkline shows the tail; everything before it was kept forever,
+          // one number per model call, for a session that can run all day.
+          if (usageTrail.length > MAX_USAGE_TRAIL) usageTrail.splice(0, usageTrail.length - MAX_USAGE_TRAIL)
         }
         dirty = true
         break
@@ -2008,11 +2409,13 @@ export async function runFullscreenTui(
           live: null,
         })
         // Old agents keep their transcript entry but their captured output is
-        // dropped, so a long session cannot grow without bound.
+        // dropped, so a long session cannot grow without bound. Only *finished*
+        // ones: a fan-out of twenty parallel agents evicted the ones still
+        // running, and their live rows and output vanished mid-run.
         while (agents.size > MAX_KEPT_AGENTS) {
-          const oldest = agents.keys().next().value
-          if (oldest === undefined) break
-          agents.delete(oldest)
+          const oldest = [...agents.values()].find(a => a.done)
+          if (!oldest) break
+          agents.delete(oldest.id)
         }
         dirty = true
         break
@@ -2036,6 +2439,14 @@ export async function runFullscreenTui(
       }
       case 'turn-end':
         dropThinking()
+        // A turn can create a branch, check one out, or commit — and the header
+        // said whatever the branch was when the session started, for the rest of
+        // the session.
+        readGitBranch(session.cwd, branch => {
+          if (branch === gitBranch) return
+          gitBranch = branch
+          dirty = true
+        })
         // A crashed turn must not leave a running ghost pinned to the composer,
         // but finished agents stay readable.
         for (const agent of agents.values()) agent.done = true
@@ -2073,17 +2484,20 @@ export async function runFullscreenTui(
           summary: event.summary,
           subject: event.subject,
           status: 'running',
+          callId: event.id,
+          step: event.step,
         })
         break
       case 'tool-end':
+        // By call id, for the same reason as the main transcript above.
         for (let i = agent.blocks.length - 1; i >= 0; i--) {
           const block = agent.blocks[i]
-          if (block.kind === 'tool' && block.status === 'running' && block.name === event.name) {
-            block.status = event.ok ? 'ok' : 'fail'
-            block.preview = event.preview
-            block.detail = summarisePreview(event.preview)
-            break
-          }
+          if (block.kind !== 'tool' || block.status !== 'running') continue
+          if (block.callId ? block.callId !== event.id : block.name !== event.name) continue
+          block.status = event.ok ? 'ok' : 'fail'
+          block.preview = event.preview
+          block.detail = summarisePreview(event.preview)
+          break
         }
         agent.tool = undefined
         break
@@ -2260,10 +2674,20 @@ export async function runFullscreenTui(
 
   // --------------------------------------------------------------- key input
 
-  const pending: string[] = []
-  let waiter: ((line: string | null) => void) | null = null
+  /**
+   * A submitted line, with whatever it had attached.
+   *
+   * `line` is what the user sees and what history replays: the placeholders,
+   * not the thousand lines behind them. `text` and `images` are what the model
+   * gets. Keeping both is what lets the transcript stay readable while the
+   * prompt stays complete.
+   */
+  type Submission = { line: string; text: string; images: ImageAttachment[] }
 
-  function submitLine(line: string): void {
+  const pending: Submission[] = []
+  let waiter: ((line: Submission | null) => void) | null = null
+
+  function submitLine(line: Submission): void {
     if (waiter) {
       const w = waiter
       waiter = null
@@ -2273,8 +2697,8 @@ export async function runFullscreenTui(
     }
   }
 
-  function nextLine(): Promise<string | null> {
-    if (pending.length > 0) return Promise.resolve(pending.shift() as string)
+  function nextLine(): Promise<Submission | null> {
+    if (pending.length > 0) return Promise.resolve(pending.shift() as Submission)
     return new Promise(resolve => (waiter = resolve))
   }
 
@@ -2394,6 +2818,14 @@ export async function runFullscreenTui(
       else if (key === '\t') modal.value += ' '
       return
     }
+    // Pasting a key or a base URL into the focused field is the whole point of
+    // the form, and a newline inside the paste must not submit it early.
+    if (modal?.kind === 'form') {
+      const field = modal.fields[modal.index]
+      if (field && printable) field.value += key
+      else if (field && key === '\t') field.value += ' '
+      return
+    }
     if (modal?.kind === 'picker') {
       if (printable) modal.filter += key
       modal.index = 0
@@ -2414,9 +2846,123 @@ export async function runFullscreenTui(
     else input += key
   }
 
+  /**
+   * A finished bracketed paste.
+   *
+   * Three shapes matter: a path to an image (which is exactly what terminals
+   * send when a file is dropped in), a block big enough to swamp the composer,
+   * and ordinary text. Only the first two are transformed; anything else lands
+   * verbatim, because a two-line paste turned into a placeholder would be worse
+   * than no folding at all.
+   */
+  /**
+   * A line break inside a bracketed paste arrives as CR, not LF — that is what
+   * the terminal sends. Counting on the raw buffer therefore found exactly one
+   * line, and a 300-line stack trace folded into `+1 lines`. Normalising here
+   * fixes the count, the fold decision and the text the model receives, all
+   * from a single place.
+   */
+  function normalizePaste(text: string): string {
+    // The BOM rides along with anything copied out of a Windows editor.
+    return text.replace(/\r\n?/g, '\n').replace(/^\uFEFF/, '')
+  }
+
+  function commitPaste(raw: string): void {
+    const text = normalizePaste(raw)
+    if (!text) return
+    // A modal owns the keyboard: no folding and no attachments there, just the
+    // characters into whichever field is focused.
+    if (modal || searching()) {
+      for (const ch of text) pasteKey(ch)
+      return
+    }
+
+    const file = imagePathIn(text)
+    if (file) {
+      detach(() => attachImageFile(file))
+      return
+    }
+
+    if (shouldFold(text)) {
+      const attachment = attachments.addText(text)
+      input += placeholderFor(attachment)
+      statusMessage = `anexado ${describeAttachment(attachment)} ${g.sep} apague o marcador para remover`
+      return
+    }
+
+    for (const ch of text) pasteKey(ch)
+  }
+
+  async function attachImageFile(file: string): Promise<void> {
+    const result = await readImageFile(file, session.cwd)
+    if (!result.ok) {
+      // The path may well have been meant as text; keeping it is the safe
+      // reading of an ambiguous paste.
+      input += file
+      statusMessage = `${result.reason} ${g.sep} colei como texto`
+      dirty = true
+      return
+    }
+    const attachment = attachments.addImage(result.data, result.mediaType, file)
+    input += placeholderFor(attachment)
+    statusMessage = `anexado ${describeAttachment(attachment)}`
+    dirty = true
+  }
+
+  /** ctrl+v: the clipboard holds bytes no terminal will ever send as keys. */
+  async function attachClipboardImage(): Promise<void> {
+    statusMessage = 'lendo imagem do clipboard...'
+    dirty = true
+    let image
+    try {
+      image = await readImageFromClipboard()
+    } catch {
+      image = null
+    }
+    if (!image) {
+      statusMessage = 'nenhuma imagem no clipboard'
+      dirty = true
+      return
+    }
+    const attachment = attachments.addImage(image.data, image.mediaType)
+    input += placeholderFor(attachment)
+    statusMessage = `anexado ${describeAttachment(attachment)}`
+    dirty = true
+  }
+
   function handleModalKey(key: string): boolean {
     if (!modal) return false
-    if (modal.kind === 'busy') return true
+    if (modal.kind === 'busy') {
+      // Everything is swallowed while the work runs, *except* the two keys that
+      // exist to get out of something: ctrl+c and esc. A modal that eats them
+      // leaves a session with a hung network call and no way to interrupt it or
+      // to quit — the only exit was killing the terminal.
+      if (key === '\x03' || key === ESC) return false
+      return true
+    }
+    // Navegável, ao contrário das outras: aqui enter tem consequência — abre a
+    // sessão destacada — então ele não pode significar "fechei de olhar".
+    if (modal.kind === 'sessionTree') {
+      const tree = modal
+      const rows = flattenTree(tree.roots)
+      if (key === ESC || key === 'q' || key === '\x13') {
+        modal = null
+      } else if (key === `${CSI}A` || key === `${ESC}OA`) {
+        tree.index = Math.max(0, tree.index - 1)
+      } else if (key === `${CSI}B` || key === `${ESC}OB`) {
+        tree.index = Math.min(Math.max(0, rows.length - 1), tree.index + 1)
+      } else if (key === '\r' || key === '\n') {
+        const chosen = rows[tree.index]
+        modal = null
+        // Reabrir a sessão em que já se está reconstruiria a tela inteira para
+        // chegar exatamente onde ela já estava.
+        if (chosen && chosen.id !== session.transcript.sessionId) detach(() => resumeSession(chosen.id))
+        else if (chosen) say('você já está nesta sessão')
+      }
+      dirty = true
+      return true
+    }
+
     if (modal.kind === 'tasks' || modal.kind === 'mcp' || modal.kind === 'workflows') {
       // Read-only: anything that means "done looking" closes it, including the
       // shortcut that opened it. `ctrl+m` is not usable as a shortcut anywhere —
@@ -2435,9 +2981,16 @@ export async function runFullscreenTui(
         modal.resolve(true)
         modal = null
       } else if (k === 'a') {
+        const tool = modal.request.tool
         session.config.permissions ??= {}
         session.config.permissions.allow ??= []
-        session.config.permissions.allow.push(modal.request.tool)
+        // Ahead of what is already there, and the matching `ask` rules go: an
+        // `ask` outranks an `allow`, so appending made "allow for the session"
+        // ask again on the very next call — the answer had no effect at all.
+        session.config.permissions.allow.unshift(tool)
+        session.config.permissions.ask = (session.config.permissions.ask ?? []).filter(
+          rule => rule !== tool && !rule.startsWith(`${tool}(`),
+        )
         modal.resolve(true)
         modal = null
       } else if (k === 'n' || key === ESC) {
@@ -2462,6 +3015,58 @@ export async function runFullscreenTui(
         modal.value = modal.value.slice(0, -1)
       } else if (key.length === 1 && key >= ' ') {
         modal.value += key
+      }
+      dirty = true
+      return true
+    }
+
+    if (modal.kind === 'form') {
+      const form = modal
+      const field = form.fields[form.index]
+      const move = (delta: number) => {
+        form.index = (form.index + delta + form.fields.length) % form.fields.length
+      }
+      // Any keystroke means the user is acting on the complaint, so it stops
+      // being shown — a stale error beside a field already fixed reads as a
+      // second, different failure.
+      form.error = undefined
+
+      if (key === ESC) {
+        const done = form.resolve
+        modal = null
+        done(null)
+      } else if (key === '\t' || key === `${CSI}B` || key === `${ESC}OB`) {
+        move(1)
+      } else if (key === `${CSI}Z` || key === `${CSI}A` || key === `${ESC}OA`) {
+        move(-1)
+      } else if (key === '\r' || key === '\n') {
+        // Enter advances while there is anywhere to advance to, and only submits
+        // from the last field. Submitting from the middle would let a stray
+        // Enter on row two write a provider with rows three onward empty.
+        if (form.index < form.fields.length - 1) {
+          move(1)
+        } else {
+          const missing = form.fields.find(f => f.required && !f.value.trim() && !f.placeholder)
+          if (missing) {
+            form.error = `${missing.label} é obrigatório`
+            form.index = form.fields.indexOf(missing)
+          } else {
+            const values = Object.fromEntries(
+              form.fields.map(f => [f.name, f.value.trim() || f.placeholder?.trim() || '']),
+            )
+            const done = form.resolve
+            modal = null
+            done(values)
+          }
+        }
+      } else if (key === '\x7f' || key === '\b') {
+        if (field) field.value = field.value.slice(0, -1)
+      } else if (key === '\x15') {
+        // ctrl+u clears the field: a pasted key is long enough that fixing it
+        // one backspace at a time is its own small punishment.
+        if (field) field.value = ''
+      } else if (key.length === 1 && key >= ' ') {
+        if (field) field.value += key
       }
       dirty = true
       return true
@@ -2545,7 +3150,7 @@ export async function runFullscreenTui(
         if (sel) activateRowAt(sel.anchor.row)
         return
       }
-      void finishSelection()
+      detach(() => finishSelection())
     }
   }
 
@@ -2588,22 +3193,51 @@ export async function runFullscreenTui(
   }
 
   function onKey(chunk: Buffer): void {
-    for (const key of splitKeys(chunk.toString('utf8'))) {
+    // Decoded across reads: a multi-byte character split between two chunks
+    // decoded as two replacement characters and typed as such.
+    const { keys, pending } = splitKeys(pendingKeys + keyDecoder.write(chunk))
+    pendingKeys = pending
+    if (pendingKeyTimer) clearTimeout(pendingKeyTimer)
+    // A real Esc keypress is indistinguishable from the start of a sequence
+    // until either the rest arrives or it does not. Nothing after this long is
+    // taken to be the key itself, so Esc still answers immediately enough to
+    // feel like a key and a split sequence is still reassembled.
+    if (pending) {
+      pendingKeyTimer = setTimeout(() => {
+        const held = pendingKeys
+        pendingKeys = ''
+        pendingKeyTimer = undefined
+        // A lone ESC that never grew into a sequence is the Esc key. A sequence
+        // that never finished is dropped: half of one is not a keystroke.
+        if (held === ESC) handleKeys([ESC])
+      }, ESC_HOLD_MS)
+      pendingKeyTimer.unref?.()
+    }
+    handleKeys(keys)
+  }
+
+  function handleKeys(keys: string[]): void {
+    for (const key of keys) {
       // Inside a bracketed paste everything is literal text — no submit, no
       // command interpretation, newlines preserved.
       if (key === PASTE_START) {
         pasting = true
+        pasteBuffer = ''
         continue
       }
       if (key === PASTE_END) {
         pasting = false
+        const pasted = pasteBuffer
+        pasteBuffer = ''
+        commitPaste(pasted)
         completionIndex = 0
         dirty = true
         continue
       }
       if (pasting) {
-        pasteKey(key)
-        dirty = true
+        // Collected whole and folded once. Feeding it through per character
+        // redrew the frame for every byte, so a big paste crawled and flickered.
+        pasteBuffer += key
         continue
       }
 
@@ -2613,6 +3247,16 @@ export async function runFullscreenTui(
       }
 
       if (handleModalKey(key)) continue
+
+      // A terminal cannot send image bytes as keys, so this asks the OS
+      // clipboard directly; text pastes still arrive as a bracketed burst.
+      //
+      // Two bindings on purpose: most terminals swallow ctrl+v as their own
+      // paste and it never reaches us, so alt+v is the one that always works.
+      if (key === '\x16' || key === `${ESC}v` || key === `${ESC}V`) {
+        detach(() => attachClipboardImage())
+        continue
+      }
 
       if (keyEcho) {
         if (key === ESC) {
@@ -2647,7 +3291,7 @@ export async function runFullscreenTui(
           statusMessage = interrupts >= 2 ? 'tchau' : 'ctrl+c de novo para sair'
           if (interrupts >= 2) {
             exiting = true
-            submitLine('')
+            submitLine({ line: '', text: '', images: [] })
           }
         }
         dirty = true
@@ -2655,7 +3299,7 @@ export async function runFullscreenTui(
       }
       if (key === '\x04' && !input) {
         exiting = true
-        submitLine('')
+        submitLine({ line: '', text: '', images: [] })
         continue
       }
       interrupts = 0
@@ -2691,7 +3335,7 @@ export async function runFullscreenTui(
       }
       // `r` desfaz o arquivo selecionado — só dentro da tela, e só com confirmação.
       if (viewingChanges && (key === 'r' || key === 'R')) {
-        void revertSelectedChange()
+        detach(() => revertSelectedChange())
         continue
       }
       // alt+↑/↓ walks the tool blocks so ctrl+r can hit any of them, not just
@@ -2729,9 +3373,29 @@ export async function runFullscreenTui(
         dirty = true
         continue
       }
+      // ctrl+s: a árvore de sessões e forks deste projeto.
+      if (key === '') {
+        if (modal?.kind === 'sessionTree') {
+          modal = null
+          dirty = true
+        } else {
+          detach(() => openSessionTree())
+        }
+        continue
+      }
       // Tab cycles the primary agent, opencode-style — but only when the command
       // popup is not open, where Tab already means "complete".
       if (key === '\t' && currentCompletions().length === 0) {
+        // Not while a turn is running: switching rebuilds the tool registry and
+        // can change the model, and the loop re-reads both between steps. A
+        // stray Tab mid-turn took away a tool the model was in the middle of
+        // using — the next call came back `Unknown tool` — and could finish the
+        // turn on a different model than it started on.
+        if (busy) {
+          statusMessage = 'troque de agente entre turnos — um turno está rodando'
+          dirty = true
+          continue
+        }
         cyclePrimaryAgent()
         continue
       }
@@ -2758,7 +3422,7 @@ export async function runFullscreenTui(
           const chosen = homeIndex >= 0 ? matches[homeIndex] : matches[0]
           if (chosen) {
             homeSearch = null
-            void resumeSession(chosen.id)
+            detach(() => resumeSession(chosen.id))
           }
           continue
         }
@@ -2811,13 +3475,16 @@ export async function runFullscreenTui(
         // Only an explicitly highlighted row opens a session; otherwise Enter
         // sends what was typed, so filtering never hijacks a prompt.
         if (home && homeIndex >= 0 && matches[homeIndex]) {
-          void resumeSession(matches[homeIndex].id)
+          detach(() => resumeSession(matches[homeIndex].id))
           continue
         }
         if (completions.length > 0) {
           input = `/${completions[completionIndex % completions.length].value}`
         }
         const line = input.trim()
+        // Placeholders are resolved here, while the store still holds them, and
+        // not at the point of use: by then the composer has been cleared.
+        const { text: expandedText, images } = expandAttachments(line, attachments)
         input = ''
         completionIndex = 0
         if (line) {
@@ -2830,7 +3497,10 @@ export async function runFullscreenTui(
             queuedLines.push(block)
             push(block)
           }
-          submitLine(line)
+          submitLine({ line, text: expandedText, images })
+          // Anything no longer referenced by the composer can go; the submission
+          // already holds what it needs.
+          attachments.sweep('')
         }
         dirty = true
         continue
@@ -2859,6 +3529,10 @@ export async function runFullscreenTui(
         } else if (home && matches.length > 0) {
           homeIndex = homeIndex <= 0 ? matches.length - 1 : homeIndex - 1
         } else if (historyIndex + 1 < history.length) {
+          // What was being typed is put aside on the way into the history, and
+          // handed back on the way out. Without it, one arrow key destroyed a
+          // half-written message with no undo of any kind.
+          if (historyIndex === -1) draft = input
           historyIndex++
           input = history[historyIndex]
         }
@@ -2878,7 +3552,8 @@ export async function runFullscreenTui(
           input = history[historyIndex]
         } else if (historyIndex === 0) {
           historyIndex = -1
-          input = ''
+          input = draft
+          draft = ''
         }
         dirty = true
         continue
@@ -3018,6 +3693,381 @@ export async function runFullscreenTui(
     })
   }
 
+  /**
+   * `/add-provider`: declares a provider in the config file, which is what
+   * `/connect` deliberately does *not* do — that one stores a credential for a
+   * provider models.dev already describes. A private gateway, a vLLM box or an
+   * internal proxy is in no catalog, so until now it meant editing JSONC by hand
+   * and restarting.
+   *
+   * The API key is the one field that does not go into the config: it goes to
+   * `auth.json`, so the file stays committable.
+   */
+  async function addProviderFlow(preset?: string): Promise<void> {
+    const target = await findConfigTarget(session.cwd)
+    const shown = target.present ? target.file : `${target.file} (será criado)`
+
+    const values = await askForm(
+      'add provider',
+      [
+        {
+          name: 'id',
+          label: 'id',
+          value: preset ?? '',
+          required: true,
+          hint: 'usado no /model como <id>/<modelo> — minúsculas, sem espaço',
+        },
+        { name: 'name', label: 'nome', value: '', hint: 'rótulo exibido; em branco usa o id' },
+        {
+          name: 'baseURL',
+          label: 'base URL',
+          value: '',
+          placeholder: 'https://…/v1',
+          required: true,
+          hint: 'endpoint compatível com OpenAI, incluindo o /v1',
+        },
+        {
+          name: 'npm',
+          label: 'npm',
+          value: '',
+          placeholder: '@ai-sdk/openai-compatible',
+          hint: 'pacote do AI SDK que implementa o provider',
+        },
+        {
+          name: 'env',
+          label: 'env',
+          value: '',
+          hint: 'nome da variável de ambiente com a chave; em branco só usa o auth.json',
+        },
+        {
+          name: 'modelKey',
+          label: 'modelo',
+          value: '',
+          required: true,
+          hint: 'apelido curto usado no /model, ex. sonnet',
+        },
+        {
+          name: 'modelId',
+          label: 'id do modelo',
+          value: '',
+          required: true,
+          hint: 'id exato que o servidor espera, ex. claude-sonnet-5',
+        },
+        {
+          name: 'context',
+          label: 'contexto',
+          value: '',
+          placeholder: '128000',
+          hint: 'janela de contexto em tokens',
+        },
+        {
+          name: 'output',
+          label: 'saída',
+          value: '',
+          placeholder: '16384',
+          hint: 'teto de tokens de saída por resposta',
+        },
+        {
+          name: 'key',
+          label: 'API key',
+          value: '',
+          masked: true,
+          hint: `opcional · vai para ${authPath()}, nunca para o arquivo de config`,
+        },
+      ],
+      {
+        detail: `grava em ${shown}`,
+        footer: 'tab/↑↓ move · enter avança, no último salva · ctrl+u limpa o campo · esc cancela',
+      },
+    )
+    if (!values) {
+      say('add-provider cancelado')
+      return
+    }
+
+    const id = values.id.trim()
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(id)) {
+      push({
+        kind: 'error',
+        text: `id inválido "${id}" — use letras, números, ponto, hífen ou underscore`,
+      })
+      return
+    }
+    // The check is against the merged config, not just the file: a provider from
+    // the user-level config would be shadowed silently, and the resulting
+    // "unknown model" would point at the wrong file entirely.
+    if (session.config.provider?.[id]) {
+      push({
+        kind: 'error',
+        text: `provider "${id}" já existe nesta configuração — use outro id ou edite ${target.file}`,
+      })
+      return
+    }
+
+    const context = Number(values.context)
+    const output = Number(values.output)
+    if (!Number.isFinite(context) || !Number.isFinite(output) || context <= 0 || output <= 0) {
+      push({ kind: 'error', text: 'contexto e saída precisam ser números positivos' })
+      return
+    }
+
+    const provider: ProviderConfig = {
+      npm: values.npm,
+      ...(values.name ? { name: values.name } : {}),
+      ...(values.env ? { env: [values.env] } : {}),
+      options: { baseURL: values.baseURL },
+      models: {
+        [values.modelKey]: {
+          id: values.modelId,
+          limit: { context, output },
+        },
+      },
+    }
+
+    let file: string
+    try {
+      file = await addProvider(target.file, id, provider)
+    } catch (err) {
+      push({ kind: 'error', text: `não deu para gravar em ${target.file}: ${describeError(err)}` })
+      return
+    }
+
+    let keyNote = ''
+    if (values.key) {
+      const authFile = await saveCredential(id, { type: 'api', key: values.key })
+      keyNote = `chave ${maskKey(values.key)} salva em \`${authFile}\``
+    }
+
+    // Applied in memory too, so `/model` reaches it in this session instead of
+    // after a restart — the config file is the record, not the mechanism.
+    session.config.provider = { ...(session.config.provider ?? {}), [id]: provider }
+
+    const ref = `${id}/${values.modelKey}`
+    push({
+      kind: 'assistant',
+      text: [
+        `**${id} adicionado** em \`${file}\``,
+        '',
+        `- \`${ref}\` ${g.sep} ${values.modelId}`,
+        `- baseURL \`${values.baseURL}\``,
+        ...(values.env ? [`- chave lida de \`${values.env}\``] : []),
+        ...(keyNote ? [`- ${keyNote}`] : []),
+        ...(values.key || values.env
+          ? []
+          : ['- sem credencial ainda — rode `/connect ' + id + '` quando tiver a chave']),
+        '',
+        `Use com \`/model ${ref}\`.`,
+      ].join('\n'),
+    })
+  }
+
+  /**
+   * `/add-model`: um modelo novo num provider que já existe.
+   *
+   * O picker vem primeiro porque a escolha do provider determina o resto —
+   * inclusive em qual arquivo isso vai ser gravado, que não é necessariamente o
+   * config do projeto: o provider pode estar declarado no config do usuário, e
+   * escrever no do projeto criaria uma segunda declaração parcial dele.
+   */
+  async function addModelFlow(preset?: string): Promise<void> {
+    const declared = Object.entries(session.config.provider ?? {})
+    if (declared.length === 0) {
+      say('nenhum provider configurado — use /add-provider primeiro')
+      return
+    }
+
+    const providerId =
+      preset && session.config.provider?.[preset]
+        ? preset
+        : await pick(
+            'em qual provider',
+            declared.map(([id, p]) => {
+              const count = Object.keys(p.models ?? {}).length
+              const base = (p.options?.baseURL as string | undefined) ?? ''
+              return {
+                label: id,
+                value: id,
+                hint: `${count} modelo${count === 1 ? '' : 's'}${base ? ` ${g.sep} ${base}` : ''}`,
+              }
+            }),
+          )
+    if (!providerId) return
+
+    const provider = session.config.provider?.[providerId]
+    if (!provider) {
+      push({ kind: 'error', text: `provider desconhecido "${providerId}"` })
+      return
+    }
+
+    const file = await findProviderFile(session.cwd, providerId)
+    if (!file) {
+      push({
+        kind: 'error',
+        text:
+          `"${providerId}" não está declarado em nenhum arquivo de config — ele veio do ` +
+          `catálogo via \`/connect\`. Use \`/add-provider\` para declará-lo antes de adicionar modelos.`,
+      })
+      return
+    }
+
+    // Os limites do último modelo viram o default: um provider costuma ter a
+    // mesma janela em toda a família, e redigitar 128000 é onde o erro entra.
+    const siblings = Object.values(provider.models ?? {})
+    const last = siblings[siblings.length - 1]
+    const existing = Object.keys(provider.models ?? {})
+
+    const values = await askForm(
+      `add model ${g.sep} ${providerId}`,
+      [
+        {
+          name: 'modelKey',
+          label: 'apelido',
+          value: '',
+          required: true,
+          hint:
+            `usado no /model como ${providerId}/<apelido>` +
+            (existing.length ? ` · já existem: ${existing.join(', ')}` : ''),
+        },
+        {
+          name: 'modelId',
+          label: 'id do modelo',
+          value: '',
+          required: true,
+          hint: 'id exato que o servidor espera, ex. claude-sonnet-5',
+        },
+        { name: 'name', label: 'nome', value: '', hint: 'rótulo exibido; em branco usa o apelido' },
+        {
+          name: 'context',
+          label: 'contexto',
+          value: '',
+          placeholder: String(last?.limit?.context ?? 128000),
+          hint: 'janela de contexto em tokens',
+        },
+        {
+          name: 'output',
+          label: 'saída',
+          value: '',
+          placeholder: String(last?.limit?.output ?? 16384),
+          hint: 'teto de tokens de saída por resposta',
+        },
+      ],
+      {
+        detail: `grava em ${file}`,
+        footer: 'tab/↑↓ move · enter avança, no último salva · ctrl+u limpa o campo · esc cancela',
+      },
+    )
+    if (!values) {
+      say('add-model cancelado')
+      return
+    }
+
+    const modelKey = values.modelKey.trim()
+    if (provider.models?.[modelKey]) {
+      push({ kind: 'error', text: `"${providerId}" já tem um modelo "${modelKey}"` })
+      return
+    }
+
+    const context = Number(values.context)
+    const output = Number(values.output)
+    if (!Number.isFinite(context) || !Number.isFinite(output) || context <= 0 || output <= 0) {
+      push({ kind: 'error', text: 'contexto e saída precisam ser números positivos' })
+      return
+    }
+
+    const model = {
+      id: values.modelId,
+      ...(values.name ? { name: values.name } : {}),
+      limit: { context, output },
+    }
+
+    try {
+      await addModel(file, providerId, modelKey, model)
+    } catch (err) {
+      push({ kind: 'error', text: `não deu para gravar em ${file}: ${describeError(err)}` })
+      return
+    }
+
+    // Em memória também, para o `/model` alcançar sem reiniciar.
+    session.config.provider = {
+      ...(session.config.provider ?? {}),
+      [providerId]: { ...provider, models: { ...(provider.models ?? {}), [modelKey]: model } },
+    }
+
+    const ref = `${providerId}/${modelKey}`
+    push({
+      kind: 'assistant',
+      text: [
+        `**${ref} adicionado** em \`${file}\``,
+        '',
+        `- id \`${values.modelId}\``,
+        `- contexto ${context} ${g.sep} saída ${output}`,
+        '',
+        `Use com \`/model ${ref}\`.`,
+      ].join('\n'),
+    })
+  }
+
+  // ------------------------------------------------------------- fork / árvore
+
+  /**
+   * Abre a árvore de sessões com a atual já destacada — quem abre isto quer
+   * saber onde está antes de escolher para onde ir.
+   */
+  async function openSessionTree(): Promise<void> {
+    const all = await listSessions(session.config, session.cwd)
+    const roots = sessionTree(all)
+    const rows = flattenTree(roots)
+    const here = rows.findIndex(r => r.id === session.transcript.sessionId)
+    modal = { kind: 'sessionTree', roots, index: here >= 0 ? here : 0 }
+    dirty = true
+  }
+
+  /**
+   * `/fork`: continua daqui numa sessão nova, deixando esta intacta.
+   *
+   * O histórico é copiado, então as duas divergem a partir deste ponto — é o
+   * caso de "quero tentar outro caminho sem perder o que já foi construído".
+   * A sessão é salva em disco na hora: sem isso ela só existiria em memória até
+   * o primeiro turno, e um fork abandonado antes disso sumiria da árvore.
+   */
+  async function forkFlow(): Promise<void> {
+    const parentTitle = titleOfCurrent()
+    const { id, parentId, atMessage } = session.forkFrom()
+
+    try {
+      await saveSessionState(session.config, {
+        id,
+        cwd: session.cwd,
+        modelRef: session.modelRef,
+        messages: session.messages,
+        parentId,
+        forkedAtMessage: atMessage,
+      })
+    } catch (err) {
+      push({ kind: 'error', text: `fork criado mas não pôde ser salvo: ${describeError(err)}` })
+    }
+
+    push({
+      kind: 'divider',
+      label: 'fork',
+      detail:
+        `#${id.slice(0, 8)} ${g.sep} de #${parentId.slice(0, 8)}` +
+        `${parentTitle ? ` (${truncate(parentTitle, 40)})` : ''} ${g.sep} ${atMessage} mensagens`,
+    })
+    statusMessage = `fork #${id.slice(0, 8)} — a sessão anterior continua salva`
+    dirty = true
+  }
+
+  /** Título da sessão atual, do primeiro texto de usuário que ela tiver. */
+  function titleOfCurrent(): string {
+    for (const message of session.messages) {
+      if (message.role !== 'user') continue
+      const text = visibleUserText(message)
+      if (text) return text.slice(0, 72)
+    }
+    return ''
+  }
+
   async function disconnectFlow(preset?: string): Promise<void> {
     const connected = await connectedProviders()
     if (connected.length === 0) {
@@ -3098,8 +4148,9 @@ export async function runFullscreenTui(
 
   try {
     while (!exiting) {
-      const line = await nextLine()
-      if (exiting || line === null) break
+      const submission = await nextLine()
+      if (exiting || submission === null) break
+      const line = submission.line
       if (!line) continue
 
       // The block for this line already exists if it waited in the queue; its
@@ -3115,14 +4166,26 @@ export async function runFullscreenTui(
           const at = blocks.indexOf(fromQueue)
           if (at >= 0) blocks.splice(at, 1)
         }
-        const result = await handleCommand(line)
+        // A command that throws must not end the session. `/connect` writing to
+        // a read-only `auth.json`, `/reload` on an unreadable asset, `/sessions`
+        // on a broken data directory — any of those used to escape this loop,
+        // taking the UI down and skipping the shutdown with it.
+        let result: 'handled' | 'passthrough' | 'exit'
+        try {
+          result = await handleCommand(line)
+        } catch (err) {
+          push({ kind: 'error', text: describeError(err) })
+          continue
+        }
         if (result === 'exit') break
         if (result === 'handled') continue
       }
 
       const expanded = line.startsWith('/') ? expandCommand(line) : null
       if (line.startsWith('/') && expanded === null) continue
-      const text = expanded ? expanded.text : line
+      // A slash command expands from the raw line; everything else uses the text
+      // with its attachments already substituted in.
+      const text = expanded ? expanded.text : submission.text
 
       // The splash and the session list belong to the startup screen only; once
       // the conversation starts they are noise.
@@ -3130,11 +4193,13 @@ export async function runFullscreenTui(
 
       if (fromQueue) {
         fromQueue.pending = false
-        scroll = 0
-        dirty = true
       } else {
         push({ kind: 'user', text: line })
       }
+      // Sending something is the one moment the view *should* jump: the answer
+      // to what was just asked is at the bottom.
+      scroll = 0
+      dirty = true
       // O foco numa tool era deliberado, mas do turno que acabou. Mantê-lo faz o
       // `ctrl+r` continuar abrindo uma chamada de vinte tools atrás, em vez da
       // que o usuário está olhando agora.
@@ -3149,9 +4214,10 @@ export async function runFullscreenTui(
       dirty = true
       const undoOverrides = expanded ? applyCommandOverrides(expanded.command) : null
       try {
-        await runTurn(session, text)
+        await runTurn(session, text, { images: submission.images })
       } catch (err) {
-        push({ kind: 'error', text: String(err) })
+        // A failure the loop already showed is not repeated here.
+        if (!(err instanceof TurnFailure && err.shown)) push({ kind: 'error', text: describeError(err) })
       } finally {
         undoOverrides?.()
       }
@@ -3200,11 +4266,22 @@ export async function runFullscreenTui(
   function applyCommandOverrides(command: SlashCommand): (() => void) | null {
     if (!command.model && !command.allowedTools) return null
     const previousModel = session.modelRef
-    if (command.model) session.setModel(resolveAgentModel(session, command.model))
+    // The agent that is running, if any, is what the registry has to go back to:
+    // rebuilding it unrestricted handed the session every tool again, quietly
+    // undoing the `tools:` list the active agent was chosen for.
+    const agent = session.primaryAgent
+    const restore = agent && agent.tools.length > 0 ? agent.tools : undefined
+    if (command.model) {
+      try {
+        session.setModelChecked(resolveAgentModel(session, command.model))
+      } catch (err) {
+        push({ kind: 'error', text: `${command.name}: ${describeError(err)}` })
+      }
+    }
     if (command.allowedTools) registerTools(session, command.allowedTools)
     return () => {
       if (command.model) session.setModel(previousModel)
-      if (command.allowedTools) registerTools(session)
+      if (command.allowedTools) registerTools(session, restore)
     }
   }
 
@@ -3226,6 +4303,8 @@ export async function runFullscreenTui(
             '- `tab` troca o agente ativo (build → agentes `mode: primary`) · `/agent` abre o picker',
             '- `ctrl+t` abre as tasks que o modelo criou · `/tasks` também',
             '- `ctrl+p` abre os servidores MCP conectados · `/mcp` também',
+            '- `ctrl+s` abre a árvore de sessões e forks · `↑↓` escolhe · `enter` entra · `/tree` também',
+            '- `/fork` continua daqui numa sessão nova; a atual fica salva e intacta',
             '- `/context-all` detalha o contexto: setup, conversa, tools, mcp, skills',
             '- `shift+tab` alterna o modo de permissão',
             '- `ctrl+r` expande/colapsa a tool focada (a última, se nenhuma estiver)',
@@ -3249,6 +4328,13 @@ export async function runFullscreenTui(
             '- fora da TUI: `hx --continue` retoma a última, `hx --resume [#id]` escolhe',
             '- o modo de permissão **não** é restaurado junto — retomar nunca reativa AUTO sozinho',
             '',
+            '# providers',
+            '- `/connect` guarda a credencial de um provider que o catálogo já conhece',
+            '- `/add-provider` declara um que ele não conhece (gateway interno, vLLM, proxy) no arquivo de config',
+            '- `/add-model` acrescenta um modelo a um provider já declarado — escolha o provider na lista',
+            '- num formulário, `tab`/`↑↓` move entre campos, `ctrl+u` limpa o campo, `enter` no último salva',
+            '- a chave nunca vai para o arquivo de config: ela vai para o `auth.json`',
+            '',
             '# modos de permissão',
             ...PERMISSION_MODES.map(m => `- \`${MODE_LABEL[m]}\` ${MODE_HELP[m]}`),
             '',
@@ -3262,8 +4348,7 @@ export async function runFullscreenTui(
           arg || (await pick('select model', listModels(session.config).map(m => ({ label: m, value: m }))))
         if (!target) return 'handled'
         try {
-          session.setModel(target)
-          session.resolveModel()
+          session.setModelChecked(target)
           say(`model → ${target}`)
         } catch (err) {
           push({ kind: 'error', text: String(err) })
@@ -3273,6 +4358,27 @@ export async function runFullscreenTui(
 
       case 'models':
         push({ kind: 'assistant', text: listModels(session.config).map(m => `- \`${m}\``).join('\n') })
+        return 'handled'
+
+      // `/connect` credencia um provider que o catálogo já descreve; este declara
+      // um que ele nunca vai descrever — gateway interno, vLLM, proxy próprio.
+      case 'add-provider':
+        await addProviderFlow(arg.trim() || undefined)
+        return 'handled'
+
+      // Um modelo novo num provider que já existe: o picker escolhe qual.
+      // Continua daqui numa sessão nova, deixando esta intacta.
+      // Mesma modal do ctrl+s: um lugar só responde "onde estou e o que existe".
+      case 'tree':
+        await openSessionTree()
+        return 'handled'
+
+      case 'fork':
+        await forkFlow()
+        return 'handled'
+
+      case 'add-model':
+        await addModelFlow(arg.trim() || undefined)
         return 'handled'
 
       case 'connect':
@@ -3526,8 +4632,14 @@ export async function runFullscreenTui(
         }
         const value = arg.trim().toLowerCase()
         const parsed = value === 'full' || value === 'cheia' || value === '0' ? 0 : Number(value)
-        if (!Number.isFinite(parsed) || parsed < 0) {
-          push({ kind: 'error', text: `largura inválida "${arg}" — use um número ou "full"` })
+        // A width below the layout's own floor is not a narrower column, it is an
+        // unusable one: `/width 12` left a screen with no room for a single row
+        // of content, and the way back was to type a command into it.
+        if (!Number.isFinite(parsed) || parsed < 0 || (parsed > 0 && parsed < MIN_WIDTH)) {
+          push({
+            kind: 'error',
+            text: `largura inválida "${arg}" — use "full" ou um número a partir de ${MIN_WIDTH}`,
+          })
           return 'handled'
         }
         session.config.ui = { ...(session.config.ui ?? {}), maxWidth: parsed }
@@ -3656,8 +4768,18 @@ function formatTokens(value: number | undefined): string {
   return `${(value / 1000).toFixed(1)}k`
 }
 
-/** Splits a raw stdin chunk into individual key events. */
-function splitKeys(data: string): string[] {
+/**
+ * Splits a raw stdin chunk into key events, keeping an unfinished escape
+ * sequence back as `pending`.
+ *
+ * A terminal does not promise that a sequence arrives in one read: over SSH, in
+ * a Windows conpty, and above all during mouse reporting — which emits hundreds
+ * of `ESC[<32;x;yM` per second while dragging — the split lands mid-sequence
+ * routinely. Parsed chunk-by-chunk, the half that ends in `ESC` became a bare
+ * Esc keypress, which aborts the running turn or wipes the composer, and the
+ * other half was typed into the composer as garbage.
+ */
+function splitKeys(data: string): { keys: string[]; pending: string } {
   const keys: string[] = []
   let i = 0
   while (i < data.length) {
@@ -3669,6 +4791,9 @@ function splitKeys(data: string): string[] {
         i += seq[0].length
         continue
       }
+      // The chunk ended inside a sequence: `ESC`, `ESC[`, `ESC[<32;12` with no
+      // final byte yet, or `ESC O` with no letter. Hold it for the next read.
+      if (/^\x1b(\[[<0-9;]*|O)?$/.test(rest)) return { keys, pending: rest }
       // Alt+<char> is ESC immediately followed by the character — including
       // alt+enter, where that character is a control code below space.
       const next = rest[1]
@@ -3689,7 +4814,7 @@ function splitKeys(data: string): string[] {
     keys.push(data[i])
     i++
   }
-  return keys
+  return { keys, pending: '' }
 }
 
 /**

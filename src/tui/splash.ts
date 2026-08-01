@@ -46,7 +46,9 @@ const FRAME_MS = 60
  * Windows cannot would degrade a perfectly capable one.
  */
 function ascii(): boolean {
-  return process.env.BYTECODE_ASCII === '1'
+  // Both spellings, like every other option: a machine configured before the
+  // rename kept getting box characters it had asked not to receive.
+  return process.env.BYTECODE_ASCII === '1' || process.env.HX_ASCII === '1'
 }
 
 function accentOf(preset: string): number {
@@ -56,10 +58,25 @@ function accentOf(preset: string): number {
 type Palette = { accent: string; dim: string; faint: string; reset: string }
 
 function palette(accent: number, out: NodeJS.WriteStream): Palette {
+  // The same switches the theme honours, checked the same way: `NO_COLOR` counts
+  // when it is *set*, empty value included — the convention — and `TERM=dumb`
+  // means the terminal cannot do this at all. Read as a truthy value, `NO_COLOR=`
+  // left the splash in full colour on a screen the rest of the UI kept plain.
+  //
   // Decided from the stream it was handed, never from `process.stdout`: the
   // function has to answer about where it will actually write.
-  if (process.env.NO_COLOR || !out.isTTY) {
+  if (process.env.NO_COLOR !== undefined || process.env.TERM === 'dumb' || !out.isTTY) {
     return { accent: '', dim: '', faint: '', reset: '' }
+  }
+  // 16-colour terminals, and anyone who asked for 16 explicitly.
+  const forced16 =
+    process.env.BYTECODE_COLOR === '16' ||
+    process.env.HX_COLOR === '16' ||
+    (!process.env.COLORTERM &&
+      process.platform !== 'win32' &&
+      !/256|kitty|alacritty|wezterm/i.test(process.env.TERM ?? ''))
+  if (forced16) {
+    return { accent: `${ESC}35m`, dim: `${ESC}37m`, faint: `${ESC}90m`, reset: `${ESC}0m` }
   }
   return {
     accent: `${ESC}38;5;${accent}m`,
@@ -181,6 +198,8 @@ export function startSplash(out: NodeJS.WriteStream = process.stdout): Splash {
   // The splash must never be the reason the process stays alive.
   timer.unref?.()
 
+  let handedOver = false
+
   const stop = (opts: StopOptions = {}): void => {
     if (stopped) return
     stopped = true
@@ -188,13 +207,20 @@ export function startSplash(out: NodeJS.WriteStream = process.stdout): Splash {
     // Cleared either way: the UI taking over inherits a blank alternate screen
     // instead of having to paint over a wordmark.
     out.write(CLEAR)
-    if (!opts.keepAltScreen) out.write(ALT_OFF + SHOW)
+    if (opts.keepAltScreen) handedOver = true
+    else out.write(ALT_OFF + SHOW)
   }
 
   // A crash before the handover would leave the terminal on the alternate screen
   // with no cursor — the shell would look broken.
+  //
+  // `handedOver` covers the gap after it: the splash stopped but left the screen
+  // on for the full-screen UI, and anything that throws between here and that
+  // UI's own `finally` — building the session tree, the first frame — used to
+  // exit with the shell still on the alternate screen. Restoring twice does
+  // nothing, so the UI's own restore is not disturbed by this one.
   process.once('exit', () => {
-    if (!stopped) out.write(CLEAR + ALT_OFF + SHOW)
+    if (!stopped || handedOver) out.write(CLEAR + ALT_OFF + SHOW)
   })
 
   return {

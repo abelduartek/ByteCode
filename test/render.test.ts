@@ -237,6 +237,49 @@ if (track === '256') {
   check('formato numerado das tools segue funcionando',
     numerado[0].includes('12 + adicionada') && numerado[1].includes('13 - removida'), JSON.stringify(numerado))
 
+  // Largura em COLUNAS, nao em code units: um emoji fora do BMP ocupa duas
+  // colunas e conta como dois code units; um ideograma ocupa duas e conta como
+  // um. Contar errado desalinha todas as colunas do quadro a partir dali.
+  check('emoji ocupa duas colunas', render.visibleWidth('🚀') === 2, String(render.visibleWidth('🚀')))
+  check('CJK ocupa duas colunas', render.visibleWidth('中文') === 4, String(render.visibleWidth('中文')))
+  check('acento combinante nao ocupa coluna', render.visibleWidth('é') === 1, String(render.visibleWidth('é')))
+  check('pad com CJK fecha na largura',
+    render.visibleWidth(render.pad('中文', 10)) === 10, String(render.visibleWidth(render.pad('中文', 10))))
+
+  // Sequencia que nao e de cor nao pode atravessar o frame: `CSI 2J` limparia a
+  // tela de dentro de uma linha.
+  const perigosa = render.oneLine(`antes ${ESC}[2J${ESC}[H depois`)
+  check('escape que move cursor e removido', !perigosa.includes('[2J') && !perigosa.includes('[H'), JSON.stringify(perigosa))
+  check('cor sobrevive ao oneLine', render.oneLine(`${ESC}[31mx${ESC}[0m`).includes('[31m'), '')
+
+  // Truncar no meio de um trecho colorido tem de fechar a cor, senao ela vaza
+  // para todas as linhas desenhadas depois.
+  const cortada = render.truncate(`${ESC}[31mvermelho bem comprido${ESC}[0m`, 10)
+  check('truncate fecha a cor aberta', cortada.includes('[0m'), JSON.stringify(cortada))
+
+  // `-- x` apagado vira `--- x` no diff: nao e cabecalho, e conteudo.
+  const sql = [
+    'diff --git a/q.sql b/q.sql',
+    '--- a/q.sql',
+    '+++ b/q.sql',
+    '@@ -1,2 +1,2 @@',
+    '--- comentario SQL apagado',
+    '+++ n incrementado',
+    ' contexto',
+  ].join('\n')
+  const sqlOut = render.renderDiff(sql, 60).map(strip).join('\n')
+  check('linha apagada que comeca com -- aparece', sqlOut.includes('comentario SQL apagado'), sqlOut)
+  check('linha adicionada que comeca com ++ aparece', sqlOut.includes('n incrementado'), sqlOut)
+  check('cabecalho --- a/ continua escondido', !sqlOut.includes('a/q.sql'), sqlOut)
+
+  // Prosa depois de um diff sem fence nao pode ser engolida como contexto.
+  const misto = render
+    .renderMarkdown('@@ -1,1 +1,1 @@\n-antigo\n+novo\n\n- item de lista\n- outro item', 60)
+    .map(strip)
+  // Renderizado igual ao mesmo bullet sozinho — nao como contexto cinza do diff.
+  const soBullet = render.renderMarkdown('- item de lista', 60).map(strip)[0]
+  check('bullet depois do diff continua bullet', misto.includes(soBullet), JSON.stringify(misto))
+
   const listas = render.renderMarkdown('1. um\n2. dois\n- [x] feito\n- [ ] pendente\n\n---', 40).map(strip)
   check('lista ordenada mantem numero', listas[0].startsWith('1. um') && listas[1].startsWith('2. dois'), JSON.stringify(listas))
   check('task marcada com check', listas[2].startsWith('✔'), JSON.stringify(listas[2]))

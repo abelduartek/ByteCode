@@ -75,6 +75,8 @@ export const workflowTool: ToolDefinition = {
         args: input.args,
         budget: typeof input.budget === 'number' ? input.budget : undefined,
         resumeFromRunId: input.resumeFromRunId ? String(input.resumeFromRunId) : undefined,
+        // Esc has to stop the fan-out, not just the call waiting on it.
+        signal: ctx.signal,
         // Workflow agents use the same live strip as the Agent tool, so a
         // fan-out of twenty steps does not write forty lines into the transcript.
         onProgress: event => {

@@ -80,6 +80,25 @@ export const toolSearchTool: ToolDefinition = {
       Number(input.max_results ?? 8),
     )
     if (loaded.length === 0) {
+      const query = String(input.query)
+      // A `select:` of something already loaded is not a failed search — the
+      // tool is right there, callable. Reporting "No tools matched" sent the
+      // model looking for a name it had just used successfully.
+      if (query.startsWith('select:')) {
+        const asked = query.slice('select:'.length).split(',').map(n => n.trim()).filter(Boolean)
+        const known = asked.filter(name => ctx.session.registry.get(name))
+        const unknown = asked.filter(name => !ctx.session.registry.get(name))
+        if (unknown.length === 0) {
+          return { text: `Already loaded and callable: ${known.join(', ')}` }
+        }
+        return {
+          text:
+            `No tool named ${unknown.join(', ')}.` +
+            (known.length > 0 ? ` Already loaded: ${known.join(', ')}.` : '') +
+            ` Still deferred: ${ctx.session.registry.deferredNames().join(', ') || 'none'}`,
+          isError: true,
+        }
+      }
       const remaining = ctx.session.registry.deferredNames()
       return {
         text:
@@ -212,6 +231,14 @@ export const agentTool: ToolDefinition = {
     const schema = asSchema(input.schema)
     const suffix = schema ? schemaInstruction(schema) : ''
 
+    // Esc stops the turn that spawned this agent; without forwarding it, the
+    // child keeps streaming and calling tools against a session the user already
+    // walked away from. `child.abort` is created by `runTurn`, so the listener
+    // reads it when it fires rather than capturing it now — which also covers
+    // the repair turn below.
+    const stopChild = (): void => child.abort?.abort()
+    ctx.signal?.addEventListener('abort', stopChild)
+
     let ok = true
     try {
       await runTurn(child, `${def.prompt}\n\n---\n\n# Task\n\n${String(input.prompt)}${suffix}`)
@@ -227,7 +254,7 @@ export const agentTool: ToolDefinition = {
     // attempt one and call it a success.
     let structured: { value: unknown } | null = null
     let schemaError = ''
-    if (schema && ok) {
+    if (schema && ok && !ctx.signal?.aborted) {
       const first = readStructured(collected)
       if (first.ok) {
         structured = { value: first.value }
@@ -245,6 +272,7 @@ export const agentTool: ToolDefinition = {
       if (!structured) ok = false
     }
 
+    ctx.signal?.removeEventListener('abort', stopChild)
     ctx.session.emit({ type: 'agent-end', id: runId, ok, chars: collected.length })
 
     await ctx.session.hooks.run(
@@ -436,6 +464,10 @@ export const agentResumeTool: ToolDefinition = {
     // the continued conversation is readable as one thing.
     ctx.session.emit({ type: 'agent-start', id, agentType: entry.agentType, label: entry.label })
 
+    // Esc on the parent turn has to reach the agent it is waiting on.
+    const stopChild = (): void => child.abort?.abort()
+    ctx.signal?.addEventListener('abort', stopChild)
+
     let ok = true
     try {
       await runTurn(child, `${String(input.prompt)}${schema ? schemaInstruction(schema) : ''}`)
@@ -443,6 +475,7 @@ export const agentResumeTool: ToolDefinition = {
       ok = false
       collected = collected || describeError(err)
     } finally {
+      ctx.signal?.removeEventListener('abort', stopChild)
       entry.busy = false
       child.emit = () => {}
       ctx.session.emit({ type: 'agent-end', id, ok, chars: collected.length })

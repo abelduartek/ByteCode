@@ -41,6 +41,9 @@ export function costOf(session: Session, stats: TurnStats): number | null {
 
   const inputRate = cost.input ?? 0
   const outputRate = cost.output ?? 0
+  // `inputTokens` covers the cache reads but not the writes: that is how the
+  // providers this harness talks to report it, and it is what the leadtime suite
+  // pins. Only the reads are taken out here, then billed at their own rate.
   const fresh = Math.max(0, stats.inputTokens - stats.cacheReadTokens)
   return (
     (fresh * inputRate +

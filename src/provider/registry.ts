@@ -80,14 +80,26 @@ async function loadFactory(npmName: string): Promise<ProviderFactory> {
   let mod: Record<string, unknown>
   try {
     mod = (await import(npmName)) as Record<string, unknown>
-  } catch {
+  } catch (esmError) {
     // Fall back to CJS resolution for packages without an ESM entry.
     try {
       mod = require_(npmName) as Record<string, unknown>
     } catch (err) {
+      // "Not installed" is only true when the module could not be *found*. A
+      // package that is installed but throws while loading — a version mismatch,
+      // a broken native binding — reported the same thing, and `npm install`
+      // then changed nothing at all.
+      const code = (err as { code?: string }).code
+      const missing = code === 'MODULE_NOT_FOUND' || code === 'ERR_MODULE_NOT_FOUND'
+      if (missing) {
+        throw new Error(
+          `provider package "${npmName}" is not installed (${(err as Error).message}). ` +
+            `Run: npm install ${npmName}`,
+        )
+      }
       throw new Error(
-        `provider package "${npmName}" is not installed (${(err as Error).message}). ` +
-          `Run: npm install ${npmName}`,
+        `provider package "${npmName}" is installed but failed to load: ` +
+          `${(esmError as Error).message} / ${(err as Error).message}`,
       )
     }
   }
@@ -120,20 +132,30 @@ async function apiKeyFor(
   const fromOptions = provider.options?.apiKey
   if (typeof fromOptions === 'string' && fromOptions) return fromOptions
 
-  for (const name of provider.env ?? []) {
-    const v = process.env[name]
-    if (v) return v
-  }
-
-  // Conventional fallback: <PROVIDER_ID>_API_KEY, upper-snake-cased.
-  const conventional = process.env[`${providerId.replace(/[^A-Za-z0-9]/g, '_').toUpperCase()}_API_KEY`]
-  if (conventional) return conventional
-
+  let stored: string | undefined
+  let ignoreEnv = false
   for (const file of authStorePaths(useOpenCodeAuth)) {
-    const key = keyOf((await readAuthFile(file))[providerId])
-    if (key) return key
+    const entry = (await readAuthFile(file))[providerId]
+    if (entry?.ignoreEnv) ignoreEnv = true
+    const key = keyOf(entry)
+    if (key && !stored) stored = key
   }
-  return undefined
+
+  // `connect` offers the environment variable and takes no for an answer: a user
+  // who declined it and typed a key had that key stored and then ignored, since
+  // the variable was still read first at every call.
+  if (!ignoreEnv) {
+    for (const name of provider.env ?? []) {
+      const v = process.env[name]
+      if (v) return v
+    }
+    // Conventional fallback: <PROVIDER_ID>_API_KEY, upper-snake-cased.
+    const conventional =
+      process.env[`${providerId.replace(/[^A-Za-z0-9]/g, '_').toUpperCase()}_API_KEY`]
+    if (conventional) return conventional
+  }
+
+  return stored
 }
 
 /**
@@ -200,7 +222,13 @@ export async function createLanguageModel(
   // The policy is part of the key: the same provider with and without the
   // caching fetch are two different instances, and reusing one for the other
   // would either lose the marker or keep it after it was turned off.
-  const cacheKey = `${npmName}::${providerId}::${JSON.stringify(headers)}::${
+  //
+  // So are the credential and the endpoint. Keyed only by name, a `/connect`
+  // that replaced an expired key mid-session kept handing back the instance
+  // built with the old one — the session went on failing to authenticate until
+  // it was restarted, with a key on disk that was perfectly good.
+  const identity = JSON.stringify([apiKey ?? null, options.baseURL ?? null, headers])
+  const cacheKey = `${npmName}::${providerId}::${identity}::${
     opts.cache?.style === 'wire' ? `wire-${opts.cache.ttl ?? 'default'}` : 'plain'
   }`
   let instance = providerCache.get(cacheKey)

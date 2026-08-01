@@ -125,7 +125,10 @@ function fg(token: Token): string {
 
 function bg(token: Token): string {
   if (level === 2) return `${CSI}48;5;${token.x}m`
-  return `${CSI}${token.fallback + 10}m`
+  // 39 is "default foreground", and 39 + 10 is "default background" — which
+  // paints nothing. Every row meant to be a filled band (the queued message,
+  // the bar) came out identical to the rest of the screen at 16 colours.
+  return `${CSI}${token.fallback === 39 ? 47 : token.fallback + 10}m`
 }
 
 function paint(name: TokenName, text: string): string {
@@ -158,7 +161,12 @@ export function bold(text: string): string {
  */
 export function hidden(text: string): string {
   if (level === 0) return text
-  return `${CSI}8m${fg(TOKENS.bg)}${text}${RESET}`
+  // At 16 colours the "background tone" is the terminal's own default
+  // foreground, so the second mechanism painted the text in plain sight for any
+  // terminal that ignores conceal. Dark grey is the closest thing to invisible
+  // that the 16-colour set actually has.
+  const tone = level === 2 ? fg(TOKENS.bg) : `${CSI}30m`
+  return `${CSI}8m${tone}${text}${RESET}`
 }
 
 /** Markdown `*emphasis*`. Attribute-only: it must survive `NO_COLOR`. */

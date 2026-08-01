@@ -116,11 +116,72 @@ function assetDirs(kind: keyof AssetsConfig, config: Config, cwd: string): strin
   return defaultRoots(cwd).flatMap(root => aliases.map(name => path.join(root, name)))
 }
 
+/**
+ * Files matching a glob pattern, sorted so the order is the same every run.
+ *
+ * Deliberately small: instruction patterns are things like `docs/*.md` or
+ * `.bytecode/rules/**​/*.md`, not a query language. `**` crosses directories,
+ * `*` and `?` stay inside one name.
+ */
+async function expandGlob(pattern: string): Promise<string[]> {
+  const normalised = pattern.replace(/\\/g, '/')
+  const firstWildcard = normalised.search(/[*?]/)
+  const rootEnd = normalised.lastIndexOf('/', firstWildcard)
+  const root = rootEnd <= 0 ? '/' : normalised.slice(0, rootEnd)
+  const rest = normalised.slice(rootEnd + 1)
+
+  const source = rest
+    .split('/')
+    .map(part =>
+      part === '**'
+        ? '.*'
+        : part
+            .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+            .replace(/\*/g, '[^/]*')
+            .replace(/\?/g, '[^/]'),
+    )
+    .join('/')
+    .replace(/\.\*\//g, '(?:.*/)?')
+  const rx = new RegExp(`^${source}$`, process.platform === 'win32' ? 'i' : '')
+
+  const out: string[] = []
+  const walk = async (dir: string, depth: number): Promise<void> => {
+    if (depth > 8) return
+    let entries: import('node:fs').Dirent[]
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) {
+        await walk(full, depth + 1)
+        continue
+      }
+      const relative = path.relative(root, full).replace(/\\/g, '/')
+      if (rx.test(relative)) out.push(full)
+    }
+  }
+  await walk(root, 0)
+  return out.sort()
+}
+
 export async function loadInstructions(config: Config, cwd: string): Promise<Instruction[]> {
   const files: string[] = []
 
   if (config.instructions && config.instructions.length > 0) {
-    files.push(...config.instructions.map(p => resolvePath(p, cwd)))
+    // Globs are expanded, as the config schema advertises: an entry like
+    // `docs/*.md` was resolved as a path with a literal `*` in it, which reads
+    // as no file at all — so a documented form silently loaded nothing.
+    for (const entry of config.instructions) {
+      const resolved = resolvePath(entry, cwd)
+      if (!/[*?]/.test(entry)) {
+        files.push(resolved)
+        continue
+      }
+      files.push(...(await expandGlob(resolved)))
+    }
   } else {
     files.push(path.join(homedir(), '.claude', 'CLAUDE.md'))
     for (const dir of PROJECT_DIRS) files.push(path.join(homedir(), dir, INSTRUCTIONS_FILE))
@@ -322,9 +383,13 @@ export async function loadCommands(config: Config, cwd: string): Promise<SlashCo
  */
 export function expandCommandBody(body: string, args: string): string {
   const positional = args.split(/\s+/).filter(Boolean)
-  return body
-    .replace(/\$ARGUMENTS/g, args)
-    .replace(/\$([1-9])/g, (_, digit: string) => positional[Number(digit) - 1] ?? '')
+  // One pass, with the substitutions inserted through a function: run as two
+  // `replace` calls with string replacements, an argument containing `$&` was
+  // rewritten by the second pass, and `$ARGUMENTS` holding something like
+  // `fix $1` had that `$1` expanded as if the user had written a placeholder.
+  return body.replace(/\$ARGUMENTS|\$([1-9])/g, (_, digit?: string) =>
+    digit === undefined ? args : (positional[Number(digit) - 1] ?? ''),
+  )
 }
 
 export async function loadAssets(config: Config, cwd: string): Promise<AssetBundle> {

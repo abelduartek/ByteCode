@@ -29,13 +29,17 @@ function rootOf(session: Session): Session {
 }
 
 /**
- * Windows paths differ only by case for the same file, and the model will use
- * whichever spelling it saw. Matching case-sensitively there would report a
- * stale file as unread.
+ * Windows and the default macOS filesystem hold one file under several
+ * spellings, and the model will use whichever one it saw. Matching
+ * case-sensitively there reports a file it just read as unread, and the write
+ * guard then refuses the edit; matching case-insensitively on Linux does the
+ * opposite, treating two different files as one.
  */
+const FOLD_CASE = process.platform === 'win32' || process.platform === 'darwin'
+
 function keyOf(file: string): string {
   const resolved = path.resolve(file)
-  return process.platform === 'win32' ? resolved.toLowerCase() : resolved
+  return FOLD_CASE ? resolved.toLowerCase() : resolved
 }
 
 function table(session: Session): Map<string, SeenFile> {

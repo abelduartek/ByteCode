@@ -15,7 +15,7 @@ import { ToolRegistry } from './tools.ts'
 import { evaluate } from './permissions.ts'
 import type { PermissionQuery, PermissionVerdict } from './permissions.ts'
 import type { SessionState } from './sessions.ts'
-import { ensureDir } from '../util/fs.ts'
+import { ancestorDirs, ensureDir } from '../util/fs.ts'
 import { CLI, VERSION, envOption, stateFile } from '../util/paths.ts'
 
 export { VERSION as BYTECODE_VERSION } from '../util/paths.ts'
@@ -59,7 +59,12 @@ export function emptyTurnStats(startedAt = Date.now()): TurnStats {
 export type UIEvent =
   | { type: 'text'; text: string }
   | { type: 'reasoning'; text: string }
-  | { type: 'tool-start'; id: string; name: string; summary: string; subject?: string }
+  /**
+   * `step` numbers the model call that asked for this tool, so a UI can tell a
+   * batch the model fired at once from calls it made one after another after
+   * seeing each result. Same number = same decision.
+   */
+  | { type: 'tool-start'; id: string; name: string; summary: string; subject?: string; step: number }
   | { type: 'tool-end'; id: string; name: string; ok: boolean; preview: string }
   | { type: 'notice'; text: string }
   | { type: 'error'; text: string }
@@ -118,6 +123,8 @@ export class Session {
   messages: ModelMessage[] = []
   mode: PermissionMode
   modelRef: string
+  /** The mode the model has been told about, so a toggle is announced once. */
+  announcedMode?: PermissionMode
   bootstrapped = false
   abort: AbortController | null = null
   /**
@@ -127,6 +134,17 @@ export class Session {
   tokenBaseline?: { messageCount: number; inputTokens: number }
   /** Set when a compaction attempt failed, so it is not retried every step. */
   compactionSuspended = false
+  /**
+   * Session this one was forked from, carried through every save so the fork
+   * tree survives a restart. Undefined means this is a root — `main` in the UI.
+   *
+   * Distinct from `parent`, which is a live object meaning "the session that
+   * spawned this subagent": that is scratch work inside a turn, this is a
+   * sibling conversation the user can switch to.
+   */
+  forkedFrom?: string
+  /** Message count copied at fork time, for "forked at turn N". */
+  forkedAtMessage?: number
   /**
    * Primary agent the session is acting as, opencode-style. Null means the plain
    * harness behaviour. Switching one replaces the prompt, may switch the model,
@@ -193,19 +211,23 @@ export class Session {
       version: VERSION,
       dataDir: this.config.dataDir,
     })
+    // Same file as before, so the next record has to link to the last one in it.
+    this.transcript.continueChain()
     this.messages = state.messages
     this.tokenBaseline = state.tokenBaseline
     this.compactionSuspended = false
+    // Without this the lineage is lost on the first save after a resume, which
+    // would silently promote every fork to a root next time the tree is drawn.
+    this.forkedFrom = state.parentId
+    this.forkedAtMessage = state.forkedAtMessage
     // The restored history already contains the bootstrap reminders, so sending
     // them again would duplicate every roster in the context.
     this.bootstrapped = true
     if (state.modelRef && state.modelRef !== this.modelRef) {
       try {
-        this.setModel(state.modelRef)
-        this.resolveModel()
+        this.setModelChecked(state.modelRef)
       } catch {
         // The saved model may no longer be configured; keep the current one.
-        this.setModel(this.modelRef)
       }
     }
   }
@@ -225,9 +247,18 @@ export class Session {
     return path.join(tmpdir(), CLI, this.transcript.sessionId)
   }
 
-  /** Cached: this was a synchronous `existsSync` on every step of the loop. */
+  /**
+   * Cached: this was a synchronous `existsSync` on every step of the loop.
+   *
+   * Walked upwards, because `.git` lives at the root of the repository and the
+   * session usually starts somewhere inside it — answering "no" for every
+   * subdirectory made the environment block tell the model there was no
+   * repository in a tree full of one.
+   */
   get isGitRepo(): boolean {
-    if (this.gitRepo === undefined) this.gitRepo = existsSync(path.join(this.cwd, '.git'))
+    if (this.gitRepo === undefined) {
+      this.gitRepo = ancestorDirs(this.cwd).some(dir => existsSync(path.join(dir, '.git')))
+    }
     return this.gitRepo
   }
 
@@ -294,6 +325,28 @@ export class Session {
     this.languageModel = undefined
   }
 
+  /**
+   * Switches models only if the ref resolves, throwing with the session still on
+   * the previous one.
+   *
+   * `setModel` commits the ref before anything validates it, and a session left
+   * pointing at a ref that cannot resolve throws from every later
+   * `resolveModel()` — including the ones the TUI makes while drawing a frame,
+   * which turns a typo into a render loop that never recovers. Anything that
+   * takes a model name from outside (a `/model` argument, a resumed session, an
+   * agent's `model:`) must come through here.
+   */
+  setModelChecked(ref: string): void {
+    const previous = this.modelRef
+    this.setModel(ref)
+    try {
+      this.resolveModel()
+    } catch (err) {
+      this.setModel(previous)
+      throw err
+    }
+  }
+
   get maxOutputTokens(): number | undefined {
     const perModel = this.resolveModel().model.limit?.output
     return this.config.maxOutputTokens ?? perModel
@@ -334,18 +387,60 @@ export class Session {
 
     const wanted = agent?.model
     if (wanted) {
+      // An unqualified name (`sonnet` with no provider) cannot be resolved, and
+      // silently keeping the previous agent's model would leave the session on a
+      // model nobody asked for. Fall back to what the session started on.
+      const fallback = this.baseModelRef ?? this.modelRef
       try {
-        this.setModel(wanted.includes('/') ? wanted : this.modelRef)
-        this.resolveModel()
+        this.setModelChecked(wanted.includes('/') ? wanted : fallback)
       } catch {
         // An agent naming a model this machine has no provider for must not make
-        // the agent unusable — keep the current one.
-        this.setModel(this.baseModelRef ?? this.modelRef)
+        // the agent unusable — keep the session's own model.
+        this.setModel(fallback)
       }
-    } else if (!agent && this.baseModelRef) {
+    } else if (this.baseModelRef) {
+      // An agent with no `model:` of its own runs on the session's model. That
+      // includes switching straight from an agent that named one: without this
+      // the previous agent's model outlived it.
       this.setModel(this.baseModelRef)
-      this.baseModelRef = undefined
+      if (!agent) this.baseModelRef = undefined
     }
+  }
+
+  /**
+   * Starts a new conversation from this one's history: same messages, same
+   * model, a new id and a new transcript, linked back to where it came from.
+   *
+   * Unlike `child()`, this is not a subagent — it replaces what this object is
+   * pointing at. The caller keeps using the same `Session`, now writing to the
+   * fork, which is what makes the switch survive into the UI without rebuilding
+   * everything around it.
+   *
+   * The history is **copied**, not shared: a fork exists so the two branches can
+   * diverge, and an array shared by reference would make every later turn on one
+   * side show up on the other.
+   */
+  forkFrom(): { id: string; parentId: string; atMessage: number } {
+    const parentId = this.transcript.sessionId
+    const atMessage = this.messages.length
+
+    this.transcript = new Transcript({
+      cwd: this.cwd,
+      version: VERSION,
+      dataDir: this.config.dataDir,
+    })
+    this.messages = this.messages.map(m => ({ ...m }))
+    this.forkedFrom = parentId
+    this.forkedAtMessage = atMessage
+    // The copied history already carries the bootstrap reminders; sending them
+    // again would duplicate every roster in the fork's context.
+    this.bootstrapped = this.messages.length > 0
+    // The baseline described a prompt this fork has not sent yet. Keeping it
+    // would have compaction decide against a measurement from another session.
+    this.tokenBaseline = undefined
+    this.compactionSuspended = false
+
+    return { id: this.transcript.sessionId, parentId, atMessage }
   }
 
   /** Spawns a child session that shares the transcript but has its own context. */

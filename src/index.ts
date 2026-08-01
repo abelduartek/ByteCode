@@ -8,6 +8,7 @@ import { Session, BYTECODE_VERSION } from './core/session.ts'
 import { McpManager } from './mcp/client.ts'
 import { discoverMcpServers, importMcpServers, inheritableMcpServers } from './mcp/discover.ts'
 import { ToolRegistry } from './core/tools.ts'
+import { PERMISSION_MODES } from './core/permissions.ts'
 import { registerTools } from './tools/index.ts'
 import { describeError, runTurn } from './core/loop.ts'
 import { killAllJobs } from './core/jobs.ts'
@@ -22,6 +23,19 @@ import { killAllJobs } from './core/jobs.ts'
  */
 function stopSplash(keepAltScreen = false): void {
   splashHandle()?.stop?.({ keepAltScreen })
+}
+
+/**
+ * Writes to stderr with the terminal given back first.
+ *
+ * While the splash is running the alternate screen belongs to it, so anything
+ * written there is erased when it clears — which is where every early-exit
+ * message went: "No model configured" was printed and then wiped, and the CLI
+ * looked like it had exited for no reason at all.
+ */
+function warn(text: string): void {
+  stopSplash()
+  process.stderr.write(text)
 }
 
 type SplashHandle = {
@@ -85,25 +99,48 @@ type Args = {
 
 function parseArgs(argv: string[]): Args {
   const args: Args = { cwd: process.cwd() }
+  /**
+   * The value of a flag that needs one.
+   *
+   * `bytecode -C` with nothing after it used to reach `path.resolve(undefined)`
+   * and come out as a raw TypeError with a stack — printed onto the alternate
+   * screen, where the splash then wiped it.
+   */
+  const value = (flag: string, at: number): string => {
+    const next = argv[at]
+    if (next === undefined || next.startsWith('-')) {
+      throw new Error(`${flag} needs a value — see \`${CLI} --help\``)
+    }
+    return next
+  }
+
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     switch (a) {
       case '-p':
       case '--print':
-        args.prompt = argv[++i]
+        args.prompt = value(a, ++i)
         break
       case '-m':
       case '--model':
-        args.model = argv[++i]
+        args.model = value(a, ++i)
         break
-      case '--mode':
-        args.mode = argv[++i] as PermissionMode
+      case '--mode': {
+        const mode = value(a, ++i)
+        // Checked here rather than silently behaving as `default`: a typo in
+        // `--mode acceptEdit` asked for one thing and got another, with the
+        // difference only visible in what the session then refused to do.
+        if (!(PERMISSION_MODES as string[]).includes(mode)) {
+          throw new Error(`--mode "${mode}" is not a permission mode — use one of: ${PERMISSION_MODES.join(', ')}`)
+        }
+        args.mode = mode as PermissionMode
         break
+      }
       case '--key':
-        args.key = argv[++i]
+        args.key = value(a, ++i)
         break
       case '--base-url':
-        args.baseURL = argv[++i]
+        args.baseURL = value(a, ++i)
         break
       case '--simple':
         args.simple = true
@@ -113,7 +150,11 @@ function parseArgs(argv: string[]): Args {
         break
       case '-r':
       case '--resume':
-        args.resume = argv[i + 1] && !argv[i + 1].startsWith('-') ? argv[++i] : true
+        // `#a1b2c3d4` is how every screen in the UI writes a session id, and it
+        // is what the help text says to pass — but the `#` is presentation, and
+        // passing it looked up an id that does not exist.
+        args.resume =
+          argv[i + 1] && !argv[i + 1].startsWith('-') ? argv[++i].replace(/^#/, '') : true
         break
       case '-c':
       case '--continue':
@@ -133,7 +174,7 @@ function parseArgs(argv: string[]): Args {
         break
       case '-C':
       case '--cwd':
-        args.cwd = path.resolve(argv[++i])
+        args.cwd = path.resolve(value(a, ++i))
         break
       case '-h':
       case '--help':
@@ -184,8 +225,14 @@ function parseArgs(argv: string[]): Args {
         break
       default:
         if (!a.startsWith('-') && args.prompt === undefined && args.command === undefined) {
-          args.prompt = argv.slice(i).join(' ')
-          i = argv.length
+          // The prompt is the run of plain words, not "everything that is left":
+          // swallowing the rest turned `bytecode explique isso --simple` into a
+          // prompt ending in "--simple", and the flag did nothing with no
+          // indication that it had been read as prose.
+          const words: string[] = []
+          while (i < argv.length && !argv[i].startsWith('-')) words.push(argv[i++])
+          i--
+          args.prompt = words.join(' ')
         }
     }
   }
@@ -286,7 +333,7 @@ async function main(): Promise<void> {
   if (args.command === 'config') {
     process.stdout.write(`sources (low to high precedence):\n`)
     for (const s of sources) process.stdout.write(`  ${s}\n`)
-    process.stdout.write(`\nresolved:\n${JSON.stringify(config, null, 2)}\n`)
+    process.stdout.write(`\nresolved:\n${JSON.stringify(redactSecrets(config), null, 2)}\n`)
     return
   }
   if (args.command === 'schema') {
@@ -335,7 +382,7 @@ Point your config at it with "$schema": "./${path.basename(target)}".
 
   const modelRef = config.model ?? listModels(config)[0]
   if (!modelRef) {
-    process.stderr.write(
+    warn(
       'No model configured. Run `bytecode init` to create a config, then set "model".\n',
     )
     process.exitCode = 1
@@ -347,7 +394,7 @@ Point your config at it with "$schema": "./${path.basename(target)}".
   // Writes always go to ~/.bytecode; ~/.hx stays readable. Said once, so a
   // machine with pre-rename data knows why it still sees it.
   if (hasLegacyState()) {
-    process.stderr.write(
+    warn(
       `Reading also from ~/.${'hx'} (from before the rename); new data goes to ~/.bytecode. ` +
         `Run \`${CLI} setup\` to copy it over.\n`,
     )
@@ -361,7 +408,7 @@ Point your config at it with "$schema": "./${path.basename(target)}".
   try {
     session.resolveModel()
   } catch (err) {
-    process.stderr.write(`${String(err)}\n`)
+    warn(`${String(err)}\n`)
     process.exitCode = 1
     return
   }
@@ -376,7 +423,7 @@ Point your config at it with "$schema": "./${path.basename(target)}".
         ? await latestSession(config, args.cwd)
         : await loadSession(config, args.cwd, resumeTarget)
     if (!state) {
-      process.stderr.write(
+      warn(
         resumeTarget === 'latest'
           ? 'No saved session for this directory yet.\n'
           : `No session matching "${resumeTarget}" in this directory. Try \`bytecode sessions\`.\n`,
@@ -385,7 +432,7 @@ Point your config at it with "$schema": "./${path.basename(target)}".
       return
     }
     session.resumeFrom(state)
-    process.stderr.write(
+    warn(
       `Resumed #${state.id.slice(0, 8)} — ${state.messages.length} messages, model ${session.modelRef}.\n`,
     )
   }
@@ -404,29 +451,63 @@ Point your config at it with "$schema": "./${path.basename(target)}".
   // The launcher started an animation before any of this was loaded; it stops
   // here, once there is something ready to take the screen. Stopping earlier
   // would leave the terminal blank for the rest of the setup.
-  if (args.prompt) {
-    stopSplash()
-    await runHeadless(session, args.prompt)
-  } else if (args.simple || !process.stdin.isTTY || !process.stdout.isTTY) {
-    // The full-screen UI needs raw mode; piped or redirected IO falls back.
-    stopSplash()
-    await runTui(session)
-  } else {
-    // The alternate screen goes straight from the splash to the UI, with no
-    // frame in between showing the shell again.
-    stopSplash(true)
-    // `--resume` with no id lands on the session list with the newest selected.
-    await runFullscreenTui(session, { focusSessions: args.resume === true })
+  try {
+    if (args.prompt) {
+      stopSplash()
+      await runHeadless(session, args.prompt)
+    } else if (args.simple || !process.stdin.isTTY || !process.stdout.isTTY) {
+      // The full-screen UI needs raw mode; piped or redirected IO falls back.
+      stopSplash()
+      await runTui(session)
+    } else {
+      // The alternate screen goes straight from the splash to the UI, with no
+      // frame in between showing the shell again.
+      stopSplash(true)
+      // `--resume` with no id lands on the session list with the newest selected.
+      await runFullscreenTui(session, { focusSessions: args.resume === true })
+    }
+  } finally {
+    await shutdown(session)
   }
+}
 
-  await session.hooks.run('SessionEnd', {
-    session_id: session.transcript.sessionId,
-    transcript_path: session.transcript.file,
-    cwd: session.cwd,
-    permission_mode: session.mode,
-  })
-  await session.mcp.close()
-  await session.transcript.flush()
+/**
+ * Everything that has to happen however the UI ended.
+ *
+ * It used to run only on the happy path, so any throw out of the UI skipped the
+ * SessionEnd hook and the transcript flush — and left MCP servers and background
+ * jobs alive, whose piped stdio keeps the event loop alive: the process did not
+ * exit, it hung, right after printing an error.
+ *
+ * Each step is guarded on its own: a failing hook must not be what stops the
+ * transcript from being written.
+ */
+async function shutdown(session: Session): Promise<void> {
+  try {
+    await session.hooks.run('SessionEnd', {
+      session_id: session.transcript.sessionId,
+      transcript_path: session.transcript.file,
+      cwd: session.cwd,
+      permission_mode: session.mode,
+    })
+  } catch (err) {
+    debugStack(err)
+  }
+  try {
+    killAllJobs(session)
+  } catch (err) {
+    debugStack(err)
+  }
+  try {
+    await session.mcp.close()
+  } catch (err) {
+    debugStack(err)
+  }
+  try {
+    await session.transcript.flush()
+  } catch (err) {
+    debugStack(err)
+  }
 }
 
 async function printDoctor(config: Config, cwd: string): Promise<void> {
@@ -514,6 +595,18 @@ async function inspectMcp(config: Config, cwd: string): Promise<void> {
     Object.fromEntries(found.map(s => [s.name, s.source])),
   )
   await manager.connect(text => process.stderr.write(`${text}\n`))
+  // Closed however the listing goes: these are live child processes with piped
+  // stdio, so a throw in the middle of printing left them running and the
+  // command never exited.
+  try {
+    await listMcpStatus(manager)
+  } finally {
+    await manager.close()
+  }
+  await reportInheritable(config, cwd)
+}
+
+async function listMcpStatus(manager: McpManager): Promise<void> {
   const registry = new ToolRegistry()
   manager.registerInto(registry)
 
@@ -539,9 +632,6 @@ async function inspectMcp(config: Config, cwd: string): Promise<void> {
       process.stdout.write(`  instructions: ${head}...\n`)
     }
   }
-
-  await manager.close()
-  await reportInheritable(config, cwd)
 }
 
 /**
@@ -641,7 +731,7 @@ async function importProviders(from?: string, enableMcp = false): Promise<void> 
 
   const raw = await readTextIfExists(source)
   if (!raw) {
-    process.stderr.write(`no config at ${source}\n`)
+    warn(`no config at ${source}\n`)
     process.exitCode = 1
     return
   }
@@ -650,7 +740,7 @@ async function importProviders(from?: string, enableMcp = false): Promise<void> 
   try {
     parsed = normalizeAliases(parseJsonc(raw, source) as Config)
   } catch (err) {
-    process.stderr.write(`${describeError(err)}\n`)
+    warn(`${describeError(err)}\n`)
     process.exitCode = 1
     return
   }
@@ -708,11 +798,22 @@ async function initConfig(cwd: string): Promise<void> {
     try {
       const oc = parseJsonc(raw, openCodePath) as Config
       if (oc.provider && Object.keys(oc.provider).length > 0) {
-        config.provider = { ...config.provider, ...oc.provider }
-        const firstProvider = Object.keys(oc.provider)[0]
-        const firstModel = Object.keys(oc.provider[firstProvider].models ?? {})[0]
+        // The imported blocks go into a file in the user's repository, which is
+        // very likely under version control. Whatever key opencode had inline
+        // stays in opencode's config: here it would be one `git add .` away from
+        // being published.
+        const { value: providers, removed } = withoutSecrets(oc.provider)
+        config.provider = { ...config.provider, ...providers }
+        const firstProvider = Object.keys(providers)[0]
+        const firstModel = Object.keys(providers[firstProvider].models ?? {})[0]
         if (firstProvider && firstModel) config.model = `${firstProvider}/${firstModel}`
-        process.stdout.write(`Imported ${Object.keys(oc.provider).length} provider(s) from ${openCodePath}\n`)
+        process.stdout.write(`Imported ${Object.keys(providers).length} provider(s) from ${openCodePath}\n`)
+        if (removed.length > 0) {
+          process.stdout.write(
+            `Left the credential(s) out of the file: ${removed.join(', ')}\n` +
+              `Run \`${CLI} connect\` to store them in auth.json, or name an env var under "env".\n`,
+          )
+        }
       }
     } catch (err) {
       process.stderr.write(`Could not read opencode config: ${String(err)}\n`)
@@ -721,21 +822,116 @@ async function initConfig(cwd: string): Promise<void> {
 
   await ensureDir(cwd)
   await fs.writeFile(target, `${JSON.stringify(config, null, 2)}\n`, 'utf8')
+
+  // The config it just wrote points at this file, so it has to exist: without
+  // it every editor opening the new config reported an unresolvable `$schema`
+  // and offered no completion at all — for a file whose whole point is being
+  // hand-edited.
+  const schemaTarget = path.join(cwd, `${CLI}.schema.json`)
+  if (!(await exists(schemaTarget))) {
+    await fs.writeFile(schemaTarget, configSchemaText(), 'utf8')
+  }
+
   process.stdout.write(
-    `Wrote ${target}\nRun \`${CLI} models\` to check, then \`${CLI}\` to start.\n`,
+    `Wrote ${target} and ${path.basename(schemaTarget)}\n` +
+      `Run \`${CLI} models\` to check, then \`${CLI}\` to start.\n`,
   )
 }
 
+/**
+ * Anything whose *name* says it carries a credential.
+ *
+ * Matched on the key, not the value: a key cannot be recognised by looking at
+ * it, and guessing by shape is how the one that does not look like a key ends up
+ * printed.
+ */
+const SECRET_KEY = /(api[-_ ]?key|secret|token|password|passwd|credential|authorization|auth[-_ ]?header|cookie)/i
+
+/** Env var names that carry a credential — same idea, for `env` blocks. */
+const SECRET_ENV = /(KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL)/
+
+/**
+ * A copy of a config with every credential replaced by a marker.
+ *
+ * `bytecode config` exists to answer "what is actually in effect", and people
+ * paste its output into issues and chats. Printing the resolved config verbatim
+ * put whatever key the config or the auth store holds straight into that paste.
+ */
+function redactSecrets(value: unknown, keyName = ''): unknown {
+  if (Array.isArray(value)) return value.map(item => redactSecrets(item, keyName))
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = redactSecrets(item, key)
+    }
+    return out
+  }
+  if (typeof value !== 'string' || value === '') return value
+  // An `env` block names variables rather than holding their values, so it is
+  // the name that decides — `{ env: { GITHUB_TOKEN: "ghp_..." } }`.
+  if (SECRET_KEY.test(keyName) || SECRET_ENV.test(keyName)) return '[redacted]'
+  return value
+}
+
+/** Strips credentials out of a config block before it is written to a file. */
+function withoutSecrets<T>(value: T): { value: T; removed: string[] } {
+  const removed: string[] = []
+  const walk = (node: unknown, keyName: string, path: string): unknown => {
+    if (Array.isArray(node)) return node.map((item, i) => walk(item, keyName, `${path}[${i}]`))
+    if (node && typeof node === 'object') {
+      const out: Record<string, unknown> = {}
+      for (const [key, item] of Object.entries(node as Record<string, unknown>)) {
+        const next = path ? `${path}.${key}` : key
+        if (typeof item === 'string' && item && (SECRET_KEY.test(key) || SECRET_ENV.test(key))) {
+          removed.push(next)
+          continue
+        }
+        out[key] = walk(item, key, next)
+      }
+      return out
+    }
+    return node
+  }
+  return { value: walk(value, '', '') as T, removed }
+}
+
+/** `BYTECODE_DEBUG=1` (or the pre-rename `HX_DEBUG=1`) asks for full stacks. */
+function wantsStacks(): boolean {
+  return Boolean(process.env.BYTECODE_DEBUG || process.env.HX_DEBUG)
+}
+
 // A CLI should report a failure in one line, not dump a provider stack trace.
-// HX_DEBUG=1 restores the full stack.
 function report(err: unknown, label: string): void {
-  const detail =
-    process.env.HX_DEBUG && err instanceof Error ? err.stack : describeError(err)
-  process.stderr.write(`${label}: ${detail}\n`)
+  const detail = wantsStacks() && err instanceof Error ? err.stack : describeError(err)
+  warn(`${label}: ${detail}\n`)
   process.exitCode = 1
 }
 
+/**
+ * A cleanup step that failed. Reported, because a transcript that was not
+ * written or a server that was not closed explains a lot of later confusion —
+ * but it never becomes the thing that stops the rest of the shutdown.
+ */
+function debugStack(err: unknown): void {
+  const detail = wantsStacks() && err instanceof Error ? err.stack : describeError(err)
+  warn(`shutdown: ${detail}\n`)
+}
+
 process.on('unhandledRejection', err => report(err, 'unhandled rejection'))
-process.on('uncaughtException', err => report(err, 'uncaught exception'))
+
+/**
+ * An uncaught exception ends the process.
+ *
+ * Reporting it and carrying on was the wrong trade: whatever state the throw
+ * escaped from is now half-updated, and in the full-screen UI the report itself
+ * lands on the alternate screen while the frame differ still believes it knows
+ * what is on it — so the session continued, visibly broken, on top of state
+ * nobody could reason about. `report` restores the terminal first, and the exit
+ * code says what happened.
+ */
+process.on('uncaughtException', err => {
+  report(err, 'uncaught exception')
+  process.exit(1)
+})
 
 main().catch(err => report(err, 'error'))

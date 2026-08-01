@@ -57,6 +57,7 @@ async function pickProvider(
   io: ConnectIO,
   catalog: Record<string, CatalogProvider>,
   query: string | undefined,
+  nonInteractive = false,
 ): Promise<CatalogProvider | null> {
   let term = query
 
@@ -83,6 +84,14 @@ async function pickProvider(
 
     io.write('matches:\n')
     matches.slice(0, 15).forEach((p, i) => io.write(`  ${i + 1}. ${describeProvider(p)}\n`))
+    // `--key` promises no questions. An ambiguous name is still an error, but a
+    // prompt nobody can answer — a script, a CI step — hangs instead of failing.
+    if (nonInteractive) {
+      io.write(
+        `"${term}" matches ${matches.length} providers — name one exactly when passing --key\n`,
+      )
+      return null
+    }
     const choice = (await io.ask('pick a number (or type another search): ')).trim()
     const index = Number(choice)
     if (Number.isInteger(index) && index >= 1 && index <= Math.min(matches.length, 15)) {
@@ -114,7 +123,7 @@ export async function runConnect(
   io.write('loading provider catalog...\n')
   const catalog = await loadCatalog()
 
-  const provider = await pickProvider(io, catalog, opts.provider)
+  const provider = await pickProvider(io, catalog, opts.provider, nonInteractive)
   if (!provider) {
     io.write('cancelled\n')
     return null
@@ -133,12 +142,14 @@ export async function runConnect(
   }
 
   let key = opts.key
+  let declinedEnv = false
   if (!key) {
     const envName = provider.env?.[0]
     const fromEnv = envName ? process.env[envName] : undefined
     if (fromEnv) {
       const use = (await io.ask(`use ${envName} from the environment? [Y/n] `)).trim().toLowerCase()
       if (use === '' || use === 'y' || use === 'yes') key = fromEnv
+      else declinedEnv = true
     }
   }
   if (!key) {
@@ -160,7 +171,14 @@ export async function runConnect(
     baseURL = answer || undefined
   }
 
-  const file = await saveCredential(provider.id, { type: 'api', key, baseURL })
+  // `ignoreEnv` is what makes "no, use this key instead" stick: without it the
+  // variable that was declined is still read first at every model call.
+  const file = await saveCredential(provider.id, {
+    type: 'api',
+    key,
+    baseURL,
+    ...(declinedEnv ? { ignoreEnv: true } : {}),
+  })
   const models = topModels(provider)
 
   io.write(`\nsaved ${maskKey(key)} for "${provider.id}" in ${file}\n`)
@@ -189,8 +207,10 @@ async function connectLocal(
   const baseURL = (provider.options?.baseURL as string | undefined) ?? '(default do provider)'
   const envName = provider.env?.[0]
 
-  let key = opts.key ?? (envName ? process.env[envName] : undefined)
-  if (key && envName && !opts.key) io.write(`usando ${envName} do ambiente\n`)
+  // Trimmed: an env var set from a file or a here-doc usually carries a newline,
+  // and the provider then rejects a key that looks correct in every log.
+  let key = (opts.key ?? (envName ? process.env[envName] : undefined))?.trim()
+  if (key && envName && !opts.key) io.write(`using ${envName} from the environment\n`)
   if (!key) {
     io.write(`${providerId} — ${provider.name ?? providerId} · ${baseURL}\n`)
     key = (await io.askSecret(`API key for ${providerId}: `)).trim()

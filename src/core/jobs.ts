@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
+import { StringDecoder } from 'node:string_decoder'
 import type { Session } from './session.ts'
 
 // Commands that outlive the turn that started them.
@@ -97,16 +98,31 @@ export function startJob(
     child: entry.child,
   }
 
-  entry.child.stdout?.on('data', d => append(job, String(d)))
-  entry.child.stderr?.on('data', d => append(job, String(d)))
+  // Decoded across chunk boundaries: a multi-byte character split between two
+  // reads came out as two replacement characters with `String(chunk)`.
+  const outDecoder = new StringDecoder('utf8')
+  const errDecoder = new StringDecoder('utf8')
+  let spawnFailed = false
+
+  entry.child.stdout?.on('data', d => append(job, outDecoder.write(d as Buffer)))
+  entry.child.stderr?.on('data', d => append(job, errDecoder.write(d as Buffer)))
   entry.child.on('error', err => {
     append(job, `\n[spawn failed] ${err.message}\n`)
     if (job.state === 'running') job.state = 'exited'
+    spawnFailed = true
     job.exitCode = -1
     job.endedAt = Date.now()
   })
   entry.child.on('close', code => {
-    job.exitCode = code
+    append(job, outDecoder.end() + errDecoder.end())
+    // Finished jobs are kept so `BashOutput` can still read them, but not
+    // forever: each holds up to 200 KB, and a session that runs the suite every
+    // few minutes accumulated all of them for as long as it lived.
+    forgetOldJobs(session)
+    // `close` reports `null` for a child that never started, which would erase
+    // the -1 the error handler just recorded — and a job that failed to spawn
+    // would read as one that exited cleanly.
+    if (!spawnFailed) job.exitCode = code
     if (job.state !== 'killed') job.state = 'exited'
     job.endedAt = Date.now()
     session.emit({
@@ -118,6 +134,20 @@ export function startJob(
 
   table(session).set(id, job)
   return job
+}
+
+/** Finished jobs kept for `BashOutput` after they exit. */
+const MAX_FINISHED_JOBS = 8
+
+/** Drops the oldest finished jobs, keeping every running one. */
+function forgetOldJobs(session: Session): void {
+  const jobs = table(session)
+  const finished = [...jobs.values()]
+    .filter(j => j.state !== 'running')
+    .sort((a, b) => (a.endedAt ?? 0) - (b.endedAt ?? 0))
+  for (const job of finished.slice(0, Math.max(0, finished.length - MAX_FINISHED_JOBS))) {
+    jobs.delete(job.id)
+  }
 }
 
 export function getJob(session: Session, id: string): Job | undefined {
@@ -144,24 +174,41 @@ export function readJob(job: Job): { text: string; lost: number } {
 }
 
 /**
- * Stops a job and everything it started.
+ * Kills a child **and everything it started**.
  *
- * On Windows `child.kill()` signals only the direct child: `powershell.exe
- * -Command "npm test"` leaves `node.exe` running, and a `KillShell` that lies
- * about having killed something is worse than not having one. `taskkill /T`
- * walks the tree.
+ * `child.kill()` signals only the direct child: `powershell.exe -Command "npm
+ * test"` leaves `node.exe` running, and on POSIX a `sh -c "a | b"` leaves both
+ * halves of the pipeline behind. Windows gets `taskkill /T`, which walks the
+ * tree; POSIX gets the process group, which is why the callers that need this
+ * spawn detached.
  */
+export function killTree(child: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): void {
+  if (!child.pid) return
+  if (process.platform === 'win32') {
+    const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+      windowsHide: true,
+    })
+    killer.on('error', () => child.kill())
+    return
+  }
+  try {
+    // Negative pid is the group. Falls back to the single child when the caller
+    // did not spawn detached, in which case there is no group to signal.
+    process.kill(-child.pid, signal)
+  } catch {
+    try {
+      child.kill(signal)
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+/** Stops a job and everything it started. */
 export function killJob(job: Job): void {
   if (job.state !== 'running') return
   job.state = 'killed'
-  if (process.platform === 'win32' && job.child.pid) {
-    const killer = spawn('taskkill', ['/PID', String(job.child.pid), '/T', '/F'], {
-      windowsHide: true,
-    })
-    killer.on('error', () => job.child.kill())
-    return
-  }
-  job.child.kill()
+  killTree(job.child)
 }
 
 /**

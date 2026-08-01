@@ -270,7 +270,11 @@ console.log('--- 401 diz onde colocar a chave ---')
 
   mock.reset()
   mock.script.push(mock.failure({ status: 401, message: 'Authentication Error, No api key passed in.' }))
-  await runTurn(s, 'oi')
+  // Uma falha permanente do provider REJEITA o turno — é assim que um subagent
+  // ou um passo de workflow descobre que não recebeu resposta nenhuma.
+  let rejeitou = false
+  await runTurn(s, 'oi').catch(() => { rejeitou = true })
+  check('falha permanente rejeita o turno', rejeitou, '')
 
   const text = errors.join('\n')
   check('nomeia o provider/modelo', text.includes('mock/tiny'), text.slice(0, 200))
@@ -283,7 +287,7 @@ console.log('--- 401 diz onde colocar a chave ---')
   errors.length = 0
   mock.reset()
   mock.script.push(mock.failure({ status: 400, message: 'bad request' }))
-  await runTurn(s, 'oi')
+  await runTurn(s, 'oi').catch(() => {})
   check('erro sem relação não ganha a dica', !errors.join('\n').includes('Sem credencial'), errors.join('\n').slice(0, 120))
   await s.mcp.close()
 }

@@ -124,6 +124,187 @@ function trackRun(session: Session, run: WorkflowRun): void {
 }
 
 /**
+ * Reads a JavaScript object literal **without running it**.
+ *
+ * `meta` is what the user is shown to decide whether to approve a workflow, so
+ * getting it must not execute the file: `new Function('return (' + literal + ')')`
+ * runs whatever is between the braces, and `{ get name() { … } }` is enough to
+ * make merely *listing* the workflows in `~/.claude/workflows` execute code.
+ * Only the literal subset is accepted — objects, arrays, strings, numbers,
+ * booleans, null — which is also exactly what a pure literal `meta` can contain.
+ *
+ * Being a real reader rather than a brace counter, it also skips comments: the
+ * previous scanner counted braces and quotes inside line and block comments, so
+ * an apostrophe in a comment ("don't") swallowed the rest of the literal.
+ */
+function readLiteral(src: string, from: number): unknown {
+  let i = from
+
+  function fail(what: string): never {
+    const line = src.slice(0, i).split('\n').length
+    throw new Error(`${what} (line ${line})`)
+  }
+
+  function skip(): void {
+    for (;;) {
+      const ch = src[i]
+      if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') {
+        i++
+        continue
+      }
+      if (ch === '/' && src[i + 1] === '/') {
+        while (i < src.length && src[i] !== '\n') i++
+        continue
+      }
+      if (ch === '/' && src[i + 1] === '*') {
+        const close = src.indexOf('*/', i + 2)
+        if (close === -1) fail('unterminated comment')
+        i = close + 2
+        continue
+      }
+      return
+    }
+  }
+
+  function escape(): string {
+    const ch = src[i++]
+    if (ch === 'n') return '\n'
+    if (ch === 't') return '\t'
+    if (ch === 'r') return '\r'
+    if (ch === 'b') return '\b'
+    if (ch === 'f') return '\f'
+    if (ch === 'v') return '\v'
+    if (ch === '0') return '\0'
+    if (ch === '\n') return ''
+    if (ch === 'x') {
+      const hex = src.slice(i, i + 2)
+      if (!/^[0-9a-fA-F]{2}$/.test(hex)) fail('bad \\x escape')
+      i += 2
+      return String.fromCharCode(parseInt(hex, 16))
+    }
+    if (ch === 'u') {
+      if (src[i] === '{') {
+        const close = src.indexOf('}', i)
+        const hex = close === -1 ? '' : src.slice(i + 1, close)
+        if (!/^[0-9a-fA-F]{1,6}$/.test(hex)) fail('bad \\u escape')
+        i = close + 1
+        return String.fromCodePoint(parseInt(hex, 16))
+      }
+      const hex = src.slice(i, i + 4)
+      if (!/^[0-9a-fA-F]{4}$/.test(hex)) fail('bad \\u escape')
+      i += 4
+      return String.fromCharCode(parseInt(hex, 16))
+    }
+    return ch ?? ''
+  }
+
+  function string(): string {
+    const quote = src[i++]
+    let out = ''
+    for (;;) {
+      const ch = src[i]
+      if (ch === undefined) fail('unterminated string')
+      if (ch === '\\') {
+        i++
+        out += escape()
+        continue
+      }
+      if (ch === quote) {
+        i++
+        return out
+      }
+      // A template that interpolates is an expression, not a literal.
+      if (quote === '`' && ch === '$' && src[i + 1] === '{') fail('`${}` is not a literal')
+      out += ch
+      i++
+    }
+  }
+
+  function object(): Record<string, unknown> {
+    i++ // {
+    const out: Record<string, unknown> = {}
+    for (;;) {
+      skip()
+      if (src[i] === '}') {
+        i++
+        return out
+      }
+      if (src[i] === undefined) fail('meta literal is not closed')
+      const quote = src[i]
+      let key: string
+      if (quote === '"' || quote === "'" || quote === '`') key = string()
+      else {
+        const name = /^[A-Za-z_$][A-Za-z0-9_$]*/.exec(src.slice(i))
+        if (!name) fail('expected a property name')
+        i += name[0].length
+        key = name[0]
+      }
+      skip()
+      if (src[i] !== ':') fail('expected `:` after a property name')
+      i++
+      out[key] = value()
+      skip()
+      if (src[i] === ',') {
+        i++
+        continue
+      }
+      if (src[i] === '}') {
+        i++
+        return out
+      }
+      fail('expected `,` or `}`')
+    }
+  }
+
+  function array(): unknown[] {
+    i++ // [
+    const out: unknown[] = []
+    for (;;) {
+      skip()
+      if (src[i] === ']') {
+        i++
+        return out
+      }
+      if (src[i] === undefined) fail('meta literal is not closed')
+      out.push(value())
+      skip()
+      if (src[i] === ',') {
+        i++
+        continue
+      }
+      if (src[i] === ']') {
+        i++
+        return out
+      }
+      fail('expected `,` or `]`')
+    }
+  }
+
+  function value(): unknown {
+    skip()
+    const ch = src[i]
+    if (ch === undefined) fail('unexpected end of meta literal')
+    if (ch === '{') return object()
+    if (ch === '[') return array()
+    if (ch === '"' || ch === "'" || ch === '`') return string()
+    if (src.startsWith('true', i)) return (i += 4), true
+    if (src.startsWith('false', i)) return (i += 5), false
+    if (src.startsWith('null', i)) return (i += 4), null
+    if (src.startsWith('undefined', i)) return (i += 9), undefined
+    const num = /^[+-]?(?:0[xX][0-9a-fA-F]+|(?:\d[\d_]*)?\.?\d[\d_]*(?:[eE][+-]?\d+)?)/.exec(src.slice(i))
+    if (num) {
+      i += num[0].length
+      return Number(num[0].replace(/_/g, ''))
+    }
+    fail('meta must be a plain literal — no variables, calls or spreads')
+  }
+
+  skip()
+  if (src[i] !== '{') fail('meta must be an object literal')
+  return object()
+}
+
+/**
  * `meta` must be a pure object literal, so it can be read without running the
  * script — the user sees what a workflow does before approving it.
  */
@@ -131,34 +312,9 @@ export function extractMeta(script: string): WorkflowMeta {
   const start = script.search(/export\s+const\s+meta\s*=\s*\{/)
   if (start === -1) throw new Error('workflow script must start with `export const meta = { ... }`')
 
-  const open = script.indexOf('{', start)
-  let depth = 0
-  let end = -1
-  let inString: string | null = null
-
-  for (let i = open; i < script.length; i++) {
-    const ch = script[i]
-    if (inString) {
-      if (ch === '\\') i++
-      else if (ch === inString) inString = null
-      continue
-    }
-    if (ch === '"' || ch === "'" || ch === '`') inString = ch
-    else if (ch === '{') depth++
-    else if (ch === '}') {
-      depth--
-      if (depth === 0) {
-        end = i
-        break
-      }
-    }
-  }
-  if (end === -1) throw new Error('workflow meta literal is not closed')
-
-  const literal = script.slice(open, end + 1)
   let meta: WorkflowMeta
   try {
-    meta = new Function(`return (${literal})`)() as WorkflowMeta
+    meta = readLiteral(script, script.indexOf('{', start)) as WorkflowMeta
   } catch (err) {
     throw new Error(`workflow meta is not a plain literal: ${describeError(err)}`)
   }
@@ -271,6 +427,12 @@ export type RunOptions = {
   /** Output-token ceiling for the whole run. Overrides `workflows.tokenBudget`. */
   budget?: number
   onProgress?: (event: WorkflowProgress) => void
+  /**
+   * The turn's signal. A fan-out can be hundreds of agents deep by the time the
+   * user presses esc; without it, the tool call returns and the fleet keeps
+   * running — spending tokens on an answer nobody is waiting for.
+   */
+  signal?: AbortSignal
 }
 
 /**
@@ -293,6 +455,7 @@ type RunContext = {
   agents: number
   tokens: number
   phase?: string
+  signal?: AbortSignal
 }
 
 export async function runWorkflow(session: Session, opts: RunOptions): Promise<WorkflowResult> {
@@ -315,8 +478,12 @@ export async function runWorkflow(session: Session, opts: RunOptions): Promise<W
     const raw = await readTextIfExists(path.join(dir, `${opts.resumeFromRunId}.jsonl`))
     for (const line of (raw ?? '').split('\n').filter(Boolean)) {
       try {
-        const entry = JSON.parse(line) as { type: string; key: string; result: unknown }
+        const entry = JSON.parse(line) as { type: string; key: string; ok?: boolean; result: unknown }
         if (entry.type !== 'agent') continue
+        // A step that failed is exactly what a resume exists to run again.
+        // Journals written before `ok` was recorded have no flag; those replay,
+        // as they did before.
+        if (entry.ok === false) continue
         const queue = cached.get(entry.key) ?? []
         queue.push(entry.result)
         cached.set(entry.key, queue)
@@ -359,6 +526,7 @@ export async function runWorkflow(session: Session, opts: RunOptions): Promise<W
     budgetTotal,
     agents: 0,
     tokens: 0,
+    signal: opts.signal,
   }
 
   let result: unknown
@@ -405,6 +573,9 @@ async function runScript(
   prefix?: string,
 ): Promise<unknown> {
   async function agent(prompt: string, options: AgentOptions = {}): Promise<unknown> {
+    // Checked here rather than only inside the limiter: a fan-out queues every
+    // step up front, and after an esc none of the queued ones should start.
+    if (ctx.signal?.aborted) throw new Error('workflow interrupted')
     if (ctx.agents >= ctx.maxAgents) throw new Error(`workflow exceeded ${ctx.maxAgents} agents`)
     // A hard ceiling, not a hint: once the budget is gone no further step runs,
     // otherwise a loop written against `remaining()` could overshoot forever.
@@ -434,13 +605,14 @@ async function runScript(
       step.endedAt = Date.now()
       ctx.emit({ type: 'agent-start', id, label: `${label} (cache)`, phase })
       ctx.emit({ type: 'agent-end', id, label, ok: true, chars: 0 })
-      await appendJournal(ctx, { type: 'agent', id, label, key, result })
+      await appendJournal(ctx, { type: 'agent', id, label, key, ok: true, result })
       return result
     }
 
     ctx.emit({ type: 'agent-start', id, label, phase })
 
     return ctx.limiter(async () => {
+      if (ctx.signal?.aborted) throw new Error('workflow interrupted')
       const child = ctx.session.child({
         modelRef: options.model ?? ctx.session.config.smallModel ?? ctx.session.modelRef,
         agentType: options.agentType ?? 'workflow',
@@ -470,6 +642,11 @@ async function runScript(
       const preamble = definition ? `${definition.prompt}\n\n---\n\n` : ''
       const suffix = options.schema ? schemaInstruction(options.schema) : ''
 
+      // The step's own turn has its own controller; esc on the turn that started
+      // the workflow has to reach it.
+      const stopChild = (): void => child.abort?.abort()
+      ctx.signal?.addEventListener('abort', stopChild)
+
       let result: unknown = null
       let ok = true
       try {
@@ -479,6 +656,8 @@ async function runScript(
         ok = false
         ctx.errors.push(`${label}: ${describeError(err)}`)
         result = null
+      } finally {
+        ctx.signal?.removeEventListener('abort', stopChild)
       }
 
       await child.transcript.flush()
@@ -486,7 +665,10 @@ async function runScript(
       step.chars = text.length
       step.endedAt = Date.now()
       ctx.emit({ type: 'agent-end', id, label, ok, chars: text.length })
-      await appendJournal(ctx, { type: 'agent', id, label, key, result })
+      // `ok` is what keeps a resume honest: a step that failed wrote `null` here
+      // and, replayed as a cache hit, the retry would "succeed" with that null
+      // without ever calling the model again.
+      await appendJournal(ctx, { type: 'agent', id, label, key, ok, result })
       return result
     })
   }

@@ -64,6 +64,32 @@ export function clearCatalogMemo(): void {
   memo = null
 }
 
+async function writeCache(catalog: Catalog): Promise<void> {
+  await ensureDir(path.dirname(cachePath()))
+  await fs.writeFile(cachePath(), JSON.stringify({ fetchedAt: Date.now(), catalog }), 'utf8')
+}
+
+/** At most one background refresh in flight, and it never rejects into a caller. */
+let refreshing: Promise<void> | null = null
+
+function refreshInBackground(): Promise<void> {
+  if (refreshing) return refreshing
+  refreshing = (async () => {
+    try {
+      const response = await fetch(CATALOG_URL, { signal: AbortSignal.timeout(30_000) })
+      if (!response.ok) return
+      const catalog = (await response.json()) as Catalog
+      memo = { fetchedAt: Date.now(), catalog }
+      await writeCache(catalog)
+    } catch {
+      /* the stale copy already answered; this is best effort */
+    } finally {
+      refreshing = null
+    }
+  })()
+  return refreshing
+}
+
 /**
  * Returns the catalog, refreshing at most once a day. A network failure falls
  * back to the cache; only a cold cache with no network is an error.
@@ -76,17 +102,24 @@ export async function loadCatalog(
   const fresh = cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS
   if (cached && fresh && !opts.force) return cached.catalog
 
+  // A stale copy is still a copy. Blocking startup for up to 30 seconds on a
+  // slow or captive network — to refresh a list of model names that changes
+  // about once a week — is a bad trade; the refresh happens in the background
+  // and the next run gets the new one.
+  if (cached && !opts.force) {
+    void refreshInBackground()
+    return cached.catalog
+  }
+
   try {
     const response = await fetch(CATALOG_URL, { signal: AbortSignal.timeout(30_000) })
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
     const catalog = (await response.json()) as Catalog
-    await ensureDir(path.dirname(cachePath()))
-    await fs.writeFile(
-      cachePath(),
-      JSON.stringify({ fetchedAt: Date.now(), catalog }),
-      'utf8',
-    )
     memo = { fetchedAt: Date.now(), catalog }
+    // Written after the result is already good. Failing to save it is a reason
+    // to fetch again next time, not a reason to throw away what was fetched and
+    // report the whole thing as a load failure.
+    await writeCache(catalog).catch(() => {})
     return catalog
   } catch (err) {
     if (cached) return cached.catalog

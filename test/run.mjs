@@ -25,6 +25,9 @@ const RUNS = [
 
 const SKIP = new Set(['helpers.ts', 'run.mjs'])
 
+/** A suite that has not finished by now is hung, not slow. */
+const SUITE_TIMEOUT_MS = 300_000
+
 function runOne({ suite, label, argv = [], env = {} }) {
   return new Promise(resolve => {
     const child = spawn(process.execPath, [...nodeArgs, path.join(here, suite), ...argv], {
@@ -46,9 +49,14 @@ function runOne({ suite, label, argv = [], env = {} }) {
     })
 
     let out = ''
-    child.stdout.on('data', d => (out += String(d)))
-    child.stderr.on('data', d => (out += String(d)))
-    child.on('close', code => {
+    let settled = false
+    // A suite that cannot be spawned at all, and one that hangs, both used to
+    // take the whole run with them: the first as an unhandled 'error' event, the
+    // second by never closing.
+    const finish = code => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
       const summary = out.match(/(\d+) passed, (\d+) failed/)
       resolve({
         label: label ?? suite.replace('.test.ts', ''),
@@ -58,7 +66,20 @@ function runOne({ suite, label, argv = [], env = {} }) {
         output: out,
         parsed: Boolean(summary),
       })
+    }
+    const timer = setTimeout(() => {
+      out += `\nFAIL ${suite} timed out after ${SUITE_TIMEOUT_MS / 1000}s\n`
+      child.kill()
+      finish(null)
+    }, SUITE_TIMEOUT_MS)
+
+    child.on('error', err => {
+      out += `\nFAIL could not start ${suite}: ${err.message}\n`
+      finish(null)
     })
+    child.stdout.on('data', d => (out += String(d)))
+    child.stderr.on('data', d => (out += String(d)))
+    child.on('close', code => finish(code))
   })
 }
 

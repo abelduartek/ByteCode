@@ -2,6 +2,7 @@ import { promises as fs } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import type { Config, McpServerConfig } from '../config/types.ts'
+import { stripJsonc } from '../config/load.ts'
 import { readTextIfExists } from '../util/fs.ts'
 
 // MCP servers declared in other tools.
@@ -32,14 +33,16 @@ type ClaudeServer = {
   headers?: Record<string, string>
 }
 
+/**
+ * The shared JSONC reader, rather than a regex.
+ *
+ * Stripping `//` comments line by line cut every URL in half — `"url":
+ * "https://api.example.com"` became `"url": "https:` — so the file failed to
+ * parse and the servers declared in it disappeared without a word.
+ */
 function parseJsonc<T>(raw: string): T | null {
-  const stripped = raw
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .split('\n')
-    .map(line => line.replace(/(^|\s)\/\/.*$/, '$1'))
-    .join('\n')
   try {
-    return JSON.parse(stripped) as T
+    return JSON.parse(stripJsonc(raw)) as T
   } catch {
     return null
   }
@@ -118,7 +121,14 @@ async function fromClaudeCode(cwd: string): Promise<DiscoveredServer[]> {
   }>(globalFile)
   if (!data) return out
 
-  const key = (p: string) => p.replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase()
+  // Case is folded only where the filesystem folds it: on Linux, `/srv/App` and
+  // `/srv/app` are different projects, and matching them together hands one
+  // project's servers to the other.
+  const foldCase = process.platform === 'win32' || process.platform === 'darwin'
+  const key = (p: string) => {
+    const normal = p.replace(/[\\/]+/g, '/').replace(/\/$/, '')
+    return foldCase ? normal.toLowerCase() : normal
+  }
   const wanted = key(cwd)
   for (const [project, entry] of Object.entries(data.projects ?? {})) {
     if (key(project) !== wanted) continue
@@ -233,7 +243,16 @@ export async function importMcpServers(
 ): Promise<{ file: string; imported: string[]; envVars: string[]; skipped: string[] }> {
   const inheritable = await inheritableMcpServers(config, cwd)
   const existingRaw = await readTextIfExists(opts.target)
-  const existing = (existingRaw ? parseJsonc<Config>(existingRaw) : null) ?? {}
+  // A file that exists but does not parse is not an empty config — it is a
+  // config with a typo in it. Treating the two the same meant an import
+  // overwrote the whole file with `{ mcp: ... }`, throwing away every other
+  // setting the user had written, to fix a missing comma.
+  const existing = existingRaw === null ? {} : parseJsonc<Config>(existingRaw)
+  if (existing === null) {
+    throw new Error(
+      `${opts.target} exists but is not valid JSONC — fix it first, or the import would replace it.`,
+    )
+  }
   const mcp: Record<string, McpServerConfig> = { ...(existing.mcp ?? {}) }
 
   const imported: string[] = []
