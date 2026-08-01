@@ -1,22 +1,47 @@
 {
-  "name": "bytecode",
+  "name": "bytecode-ai",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "ByteCode — multi-provider agent harness with Claude Code semantics and an opencode-style provider layer",
-  "bin": {
-    "bytecode": "./bin/bytecode.mjs",
-    "bc": "./bin/bytecode.mjs"
+  "keywords": [
+    "agent",
+    "ai",
+    "cli",
+    "coding-agent",
+    "llm",
+    "mcp",
+    "terminal",
+    "tui"
+  ],
+  "license": "MIT",
+  "author": "Abel Duarte",
+  "homepage": "https://github.com/abelduartek/ByteCode#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/abelduartek/ByteCode.git"
   },
+  "bugs": {
+    "url": "https://github.com/abelduartek/ByteCode/issues"
+  },
+  "bin": {
+    "bytecode": "./bin/bytecode.mjs"
+  },
+  "files": [
+    "bin",
+    "dist"
+  ],
   "engines": {
     "node": ">=22.6"
   },
   "scripts": {
-    "bytecode": "node --experimental-strip-types src/index.ts",
+    "build": "tsc -p tsconfig.build.json",
     "bun:bytecode": "bun src/index.ts",
-    "typecheck": "tsc --noEmit",
+    "bytecode": "node --experimental-strip-types src/index.ts",
+    "check": "npm run typecheck && npm test",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run check",
     "test": "node test/run.mjs",
-    "check": "npm run typecheck && npm test"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^4.0.23",

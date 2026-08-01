@@ -1,0 +1,21 @@
+// Emissão para o pacote publicado, e só para ele.
+//
+// Rodar do repositório continua sem build: o Node ≥ 22.6 apaga os tipos ao
+// carregar. O que **não** funciona é fazer isso dentro de `node_modules` — o
+// Node recusa com `ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`, que é
+// exatamente onde um pacote instalado mora. Então o npm recebe JavaScript.
+//
+// `rewriteRelativeImportExtensions` é o que torna isso possível sem tocar no
+// código: os imports são escritos com a extensão real (`./session.ts`), como o
+// runtime exige, e a emissão os reescreve para `.js`.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "rewriteRelativeImportExtensions": true,
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": ["src/**/*.ts"]
+}

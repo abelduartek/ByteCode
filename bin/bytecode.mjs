@@ -10,12 +10,24 @@
 // point: the modules being waited on include everything that could draw, so
 // anything loaded later cannot show that it is loading.
 import { spawnSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { dirname, join } from 'node:path'
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
-const entry = join(root, 'src', 'index.ts')
 const argv = process.argv.slice(2)
+
+// Two shapes, and the difference is where this copy came from.
+//
+// From the repository there is only `src/`, and the Node runtime erases the
+// types on load — no build, edit and run. Installed from npm the package ships
+// `dist/`, because Node refuses to strip types under `node_modules`
+// (`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`) and a published CLI lives
+// exactly there.
+const built = existsSync(join(root, 'dist', 'index.js'))
+const dir = built ? 'dist' : 'src'
+const ext = built ? '.js' : '.ts'
+const entry = join(root, dir, `index${ext}`)
 
 /**
  * Commands that print and exit. They finish about as fast as the animation would
@@ -43,16 +55,17 @@ const url = (...parts) => pathToFileURL(join(root, ...parts)).href
  * progress line.
  */
 const STAGES = [
-  ['lendo a configuração', ['src', 'config', 'load.ts']],
-  ['conectando o provider', ['src', 'provider', 'registry.ts']],
-  ['carregando agents e skills', ['src', 'assets', 'index.ts']],
-  ['preparando o MCP', ['src', 'mcp', 'client.ts']],
-  ['montando a interface', ['src', 'tui', 'fullscreen.ts']],
+  ['lendo a configuração', [dir, 'config', `load${ext}`]],
+  ['conectando o provider', [dir, 'provider', `registry${ext}`]],
+  ['carregando agents e skills', [dir, 'assets', `index${ext}`]],
+  ['preparando o MCP', [dir, 'mcp', `client${ext}`]],
+  ['montando a interface', [dir, 'tui', `fullscreen${ext}`]],
 ]
 
-if (major >= 23) {
+// Já é JavaScript, ou o Node desta máquina apaga os tipos sozinho.
+if (built || major >= 23) {
   const splash = interactive
-    ? (await import(url('src', 'tui', 'splash.ts'))).startSplash()
+    ? (await import(url(dir, 'tui', `splash${ext}`))).startSplash()
     : { stop: () => {}, stage: () => {} }
   try {
     // Handed to the app so the animation lasts until the first frame is ready,

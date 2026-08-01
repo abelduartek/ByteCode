@@ -9,3 +9,7 @@ bytecode.local.jsonc
 hx.local.jsonc
 *.local.json
 auth.json
+
+# Emissão para o pacote publicado; o repositório roda direto de src/.
+dist/
+*.tgz

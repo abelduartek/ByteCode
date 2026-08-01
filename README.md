@@ -11,7 +11,7 @@ a do opencode: pacotes do AI SDK carregados por nome, modelos escritos como
 Claude Code roda aqui sem alteração; um bloco `provider` do opencode é lido como está.
 
 ```
-Node ≥ 22.6 · sem build · 52 módulos · 20.507 linhas · 4 dependências · 1.562 asserções
+Node ≥ 22.6 · sem build · 52 módulos · 20.507 linhas · 4 dependências · 1.567 asserções
 ```
 
 **[Como funciona por dentro →](https://claude.ai/code/artifact/ffa8182b-58e2-41df-81ff-4e8a1de4cd83)**
@@ -22,15 +22,23 @@ Node ≥ 22.6 · sem build · 52 módulos · 20.507 linhas · 4 dependências ·
 ## Instalação
 
 ```bash
+npm install -g bytecode-ai
+bytecode --help
+```
+
+Ou a partir do repositório, para desenvolver:
+
+```bash
 git clone https://github.com/abelduartek/ByteCode.git
 cd ByteCode
 npm install
 node bin/bytecode.mjs --help
 ```
 
-Não existe etapa de build. O Node ≥ 22.6 apaga os tipos do TypeScript ao carregar, então
-`src/index.ts` é executado como está. O pacote `typescript` serve só para o `tsc --noEmit`
-checar tipos.
+Rodando do repositório não existe etapa de build: o Node ≥ 22.6 apaga os tipos do
+TypeScript ao carregar, e `src/index.ts` é executado como está. O pacote do npm traz
+JavaScript já emitido em `dist/`, porque o Node recusa apagar tipos dentro de
+`node_modules` — o launcher usa `dist/` quando existe e `src/` quando não.
 
 Roda em Windows, macOS e Linux. Nada aponta para caminho fixo: os binários externos são
 descobertos pelo `PATH` e por variáveis de ambiente.
@@ -46,9 +54,9 @@ a tool `Bash` usa `/bin/sh` direto.
 ## Primeiro uso
 
 ```bash
-node bin/bytecode.mjs init          # escreve bytecode.jsonc e o JSON Schema dele
-node bin/bytecode.mjs connect       # credencia um provider do catálogo models.dev
-node bin/bytecode.mjs               # sessão interativa
+bytecode init          # escreve bytecode.jsonc e o JSON Schema dele
+bytecode connect       # credencia um provider do catálogo models.dev
+bytecode               # sessão interativa
 ```
 
 O `connect` pergunta o provider, aceita a chave e a grava em `~/.bytecode/auth.json` com
@@ -57,8 +65,8 @@ permissão `600` — nunca no arquivo de config, que costuma estar sob controle 
 Sem interação:
 
 ```bash
-node bin/bytecode.mjs connect anthropic --key sk-ant-...
-node bin/bytecode.mjs -m anthropic/opus -p "explique src/core/loop.ts"
+bytecode connect anthropic --key sk-ant-...
+bytecode -m anthropic/opus -p "explique src/core/loop.ts"
 ```
 
 ## Comandos
@@ -216,8 +224,9 @@ cache funcionar atrás de proxies no formato OpenAI.
 
 ```bash
 npm run typecheck    # tsc --noEmit
-npm test             # 1.562 asserções, 26 execuções de suíte
+npm test             # 1.567 asserções, 26 execuções de suíte
 npm run check        # os dois
+npm run build        # emite dist/ — só o pacote publicado precisa disso
 ```
 
 O runner é próprio, 130 linhas, um processo por execução de suíte — várias delas leem

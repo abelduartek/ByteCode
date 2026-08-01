@@ -7,7 +7,7 @@
 // com seis chaves numa única tarde.
 
 const { ROOT, SRC: R, reporter } = await import('./helpers.ts')
-const { promises: fsp } = await import('node:fs')
+const { promises: fsp, existsSync } = await import('node:fs')
 const nodePath = await import('node:path')
 
 const { check, log, done } = reporter()
@@ -148,6 +148,37 @@ log('--- o hx.jsonc do repo aponta para um arquivo que existe ---')
   const mcpProps = (props.mcp as any).additionalProperties.properties
   const foraDoMcp = servidores.flatMap(s => Object.keys(s).filter(k => !(k in mcpProps)))
   check('e os servidores MCP também', foraDoMcp.length === 0, `fora: ${foraDoMcp.join(', ')}`)
+}
+
+// A versão vive em dois lugares: no `package.json`, que é o que o npm publica, e
+// em `util/paths.ts`, que é o que `--version` e o transcript gravam. Publicar um
+// pacote 0.2.0 cujo binário se apresenta como 0.1.0 é o tipo de coisa que só
+// aparece num relato de bug meses depois.
+log('--- versão única ---')
+{
+  const pkg = JSON.parse(await fsp.readFile(nodePath.join(ROOT, 'package.json'), 'utf8'))
+  const { VERSION } = await import(`${R}/util/paths.ts`)
+  check('package.json e util/paths.ts dizem a mesma versão',
+    pkg.version === VERSION, `package.json ${pkg.version} vs VERSION ${VERSION}`)
+
+  // O pacote publica JavaScript, não a fonte: o Node recusa apagar tipos dentro
+  // de `node_modules`, que é onde um CLI instalado mora. O launcher escolhe
+  // `dist/` quando existe e cai em `src/` quando não — é assim que o mesmo
+  // arquivo serve o pacote e o repositório.
+  const files: string[] = pkg.files ?? []
+  check('o pacote publica bin/ e dist/',
+    files.includes('bin') && files.includes('dist'), JSON.stringify(files))
+  check('e existe um script que produz o dist/',
+    typeof pkg.scripts?.build === 'string' && pkg.scripts.build.includes('tsconfig.build.json'),
+    String(pkg.scripts?.build))
+
+  const launcher = await fsp.readFile(nodePath.join(ROOT, 'bin', 'bytecode.mjs'), 'utf8')
+  check('o launcher conhece os dois modos',
+    launcher.includes("'dist'") && launcher.includes("'src'"), '')
+  check('o binário declarado é o que existe no disco',
+    Object.values(pkg.bin as Record<string, string>).every(p =>
+      existsSync(nodePath.join(ROOT, String(p)))),
+    JSON.stringify(pkg.bin))
 }
 
 done()
