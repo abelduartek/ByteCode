@@ -1,7 +1,8 @@
 import { promises as fs } from 'node:fs'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { homedir, cpus } from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { Session } from './session.ts'
 import { runTurn } from './loop.ts'
 // Shared with the `Agent` tool, so the two ways of asking for JSON cannot drift.
@@ -87,7 +88,15 @@ export type WorkflowResult = {
 /** A script saved on disk under `workflows/`, callable by name. */
 export type SavedWorkflow = { name: string; description: string; file: string }
 
-const DEFAULT_MAX_AGENTS = 1000
+/**
+ * Freio de emergência: o passo que cruzaria o teto falha em vez de rodar.
+ *
+ * Eram 1000. A ordem de grandeza observada é ~100k tokens de entrada por agente,
+ * então mil agentes é um teto que não protege de nada — a conta já teria doído
+ * muito antes. Cinquenta é o mesmo teto que o Claude Code usa para a diretriz
+ * `large`, e quem precisar de mais declara `workflows.maxAgents`.
+ */
+const DEFAULT_MAX_AGENTS = 50
 /** Runs kept for the viewer. Old ones fall off so a long session stays bounded. */
 const MAX_KEPT_RUNS = 5
 /** Log lines kept per run, for the same reason. */
@@ -335,7 +344,21 @@ export function workflowSearchDirs(cwd: string): string[] {
     ...PROJECT_DIRS.map(dir => path.join(cwd, dir, 'workflows')),
     path.join(home, '.claude', 'workflows'),
     ...PROJECT_DIRS.map(dir => path.join(home, dir, 'workflows')),
+    // Os que vêm com o próprio ByteCode, por último: um workflow do usuário com
+    // o mesmo nome ganha, porque `listWorkflows` fica com o primeiro que achar.
+    bundledWorkflowDir(),
   ]
+}
+
+/**
+ * A pasta `workflows/` do próprio pacote.
+ *
+ * Sobe a partir deste módulo até a raiz — que é `<pacote>/dist/core/` quando
+ * instalado do npm e `<repo>/src/core/` num checkout. Os dois têm a mesma
+ * distância da raiz, então uma conta serve para os dois.
+ */
+function bundledWorkflowDir(): string {
+  return path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'workflows')
 }
 
 /** Run artifacts share the directory with saved scripts; they are not workflows. */
@@ -468,17 +491,41 @@ export async function runWorkflow(session: Session, opts: RunOptions): Promise<W
   const journalPath = path.join(dir, `${runId}.jsonl`)
   await fs.writeFile(scriptPath, opts.script, 'utf8')
 
+  // A aprovação vale para um artefato, não para uma intenção.
+  //
+  // Retomar reaproveita os passos já pagos do run anterior. Sem amarrar o
+  // journal ao texto exato que foi aprovado, um workflow aprovado como "ler e
+  // resumir arquivos" pode ser retomado com outro corpo, herdando aqueles
+  // passos — e o "sim" do usuário passa a cobrir algo que ele nunca leu.
+  const sha256 = createHash('sha256').update(opts.script).digest('hex')
+
   // Resume matches on the exact (prompt, options) pair, never on position or
   // call id: the journal is written in completion order, and with concurrent
   // stages even the call order varies between runs. An identical key means
   // identical inputs, so replaying is sound. Duplicate keys are queued so a
   // step that legitimately runs twice replays twice.
   const cached = new Map<string, unknown[]>()
+  /** Hash gravado pelo run que está sendo retomado; ausente em journal antigo. */
+  let aprovado: string | undefined
   if (opts.resumeFromRunId) {
     const raw = await readTextIfExists(path.join(dir, `${opts.resumeFromRunId}.jsonl`))
     for (const line of (raw ?? '').split('\n').filter(Boolean)) {
       try {
-        const entry = JSON.parse(line) as { type: string; key: string; ok?: boolean; result: unknown }
+        const entry = JSON.parse(line) as {
+          type: string
+          key: string
+          ok?: boolean
+          sha256?: string
+          result: unknown
+        }
+        // O `begin` carrega o hash do script que produziu aquele journal.
+        // Anotado aqui e cobrado depois do laço: lançar de dentro cairia no
+        // `catch` abaixo, que existe para tolerar linha truncada e engoliria a
+        // divergência junto.
+        if (entry.type === 'begin') {
+          aprovado = entry.sha256
+          continue
+        }
         if (entry.type !== 'agent') continue
         // A step that failed is exactly what a resume exists to run again.
         // Journals written before `ok` was recorded have no flag; those replay,
@@ -490,6 +537,16 @@ export async function runWorkflow(session: Session, opts: RunOptions): Promise<W
       } catch {
         /* a truncated journal just means fewer replayable steps */
       }
+    }
+
+    // Journal sem `begin` é de antes desta verificação existir: retomar continua
+    // valendo, porque recusar quebraria runs que já estavam no disco.
+    if (aprovado !== undefined && aprovado !== sha256) {
+      throw new Error(
+        `o script mudou desde que o run ${opts.resumeFromRunId} foi aprovado. ` +
+          `Rode sem "resumeFromRunId" para aprovar o texto novo — o resume reaproveita ` +
+          `passos já pagos, e eles pertencem ao script que você leu.`,
+      )
     }
   }
 
@@ -528,6 +585,10 @@ export async function runWorkflow(session: Session, opts: RunOptions): Promise<W
     tokens: 0,
     signal: opts.signal,
   }
+
+  // Primeira linha do journal, antes de qualquer passo: é o que amarra os
+  // resultados gravados abaixo ao texto exato que foi aprovado.
+  await appendJournal(ctx, { type: 'begin', sha256, name: meta.name })
 
   let result: unknown
   try {

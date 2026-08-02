@@ -366,6 +366,7 @@ const BUILTIN_COMMANDS: { name: string; hint: string }[] = [
   { name: 'tools', hint: 'tools ativas e deferred' },
   { name: 'mcp', hint: 'servidores MCP' },
   { name: 'workflows', hint: 'progresso dos workflows · on/off liga e desliga' },
+  { name: 'ultracode', hint: 'effort xhigh + workflows, só nesta sessão · off desfaz' },
   { name: 'mouse', hint: 'liga/desliga captura do mouse' },
   { name: 'copy', hint: 'copia a tela inteira' },
   { name: 'keys', hint: 'mostra a sequência que cada tecla envia' },
@@ -536,6 +537,16 @@ export async function runFullscreenTui(
   let strip: LiveAgent[] = []
   /** Block the expand shortcut acts on. Null means "the last tool", as before. */
   let focusedTool: number | null = null
+  /** Se o foco atual, sozinho, basta para desfazer uma dobra — ver `opened()`. */
+  let focusHoldsFoldOpen = false
+  /**
+   * O que o `/ultracode` encontrou ligado, para poder devolver.
+   *
+   * Lido uma vez, antes de qualquer alteração: depois que o comando roda, a
+   * config em memória já é a dele, e não haveria mais como saber o que era.
+   */
+  const configuredWorkflowsEnabled = session.config.workflows?.enabled
+  let ultracodeAnterior: { effort: typeof session.config.effort; workflows: boolean } | null = null
   /** Blocks already on screen for lines waiting behind the running turn, in order. */
   const queuedLines: Block[] = []
 
@@ -868,11 +879,18 @@ export async function runFullscreenTui(
           ? c.ok(`mcp(${mcp})`)
           : c.warn(`mcp(${mcp}/${servers.length})`)
 
+    // Orquestração é a única coisa aqui que gasta a frota inteira sem o usuário
+    // pedir passo a passo, então saber se está ligada não pode depender de
+    // tentar usar. Fica ao lado do `/workflows`, que é o que a liga e desliga.
+    // Curto porque a barra é disputada: quando ela não cabe, o `split` corta o
+    // fim — e o fim é o `ctx`, que ninguém quer perder. `/workflows` liga e
+    // desliga, e está no `/help`.
+    const workflowsOn = session.registry.get('Workflow') !== undefined
+    const workflows = workflowsOn ? c.ok('wf on') : c.faint('wf off')
+
     // Only shown once something was written: an always-there `alt(0)` would be
     // one more thing competing for the bar with nothing to say.
     const changes = changedFiles(session).length
-    const changed = changes > 0 ? c.faint('ctrl+g ') + c.meta(`alterações(${changes})`) + c.faint(` ${g.sep} `) : ''
-
     // "Onde estou" tem de estar visível sem abrir nada: numa sessão raiz isto
     // diz (main); num fork, o id curto — que é o que distingue duas telas com a
     // mesma conversa até o ponto da bifurcação.
@@ -880,26 +898,23 @@ export async function runFullscreenTui(
       ? c.warn(`fork(#${session.transcript.sessionId.slice(0, 8)})`)
       : c.faint('(main)')
 
-    const left =
-      c.faint('shift+tab ') +
-      paintMode(session.mode) +
-      c.faint(` ${g.sep} `) +
-      c.faint('tab ') +
-      c.meta(agentName) +
-      c.faint(` ${g.sep} `) +
-      c.faint('ctrl+t ') +
-      tasks +
-      c.faint(` ${g.sep} `) +
-      changed +
-      c.faint('ctrl+p ') +
-      mcpLabel +
-      c.faint(` ${g.sep} `) +
-      c.faint('ctrl+s ') +
-      sessionLabel +
-      c.faint(` ${g.sep} `) +
-      c.dim('ctx ') +
-      pct +
-      trail
+    // A barra é montada por segmentos com prioridade, e não como uma string só.
+    // Quando o lado direito cresce — uma mensagem longa de status — o que não
+    // couber é **removido inteiro**, do menos importante para o mais. Cortando a
+    // string, o que sumia era o fim dela: o `ctx`, que é justamente o número que
+    // ninguém quer perder de vista.
+    const segments: { text: string; keep: number }[] = [
+      { text: c.faint('shift+tab ') + paintMode(session.mode), keep: 100 },
+      { text: c.dim('ctx ') + pct + trail, keep: 90 },
+      { text: c.faint('tab ') + c.meta(agentName), keep: 80 },
+      { text: workflows, keep: 60 },
+      { text: c.faint('ctrl+t ') + tasks, keep: 50 },
+      { text: c.faint('ctrl+p ') + mcpLabel, keep: 40 },
+      { text: c.faint('ctrl+s ') + sessionLabel, keep: 30 },
+      // Arquivo escrito e ainda não revisado pesa mais que a etiqueta da sessão:
+      // é a única coisa na barra que pede uma ação.
+      ...(changes > 0 ? [{ text: c.faint('ctrl+g ') + c.meta(`alterações(${changes})`), keep: 70 }] : []),
+    ]
 
     const right = scroll > 0
       ? c.warn(`rolado ${scroll} linhas`) + c.faint(` ${g.sep} ctrl+end volta ao fim`)
@@ -909,7 +924,24 @@ export async function runFullscreenTui(
           ? c.warn(statusMessage)
           : c.faint('/help')
 
-    return split(left, right, width)
+    // Ordem de leitura fixa, independente de quem foi descartado: uma barra cujo
+    // conteúdo troca de lugar conforme a largura obriga a reler tudo a cada vez.
+    const order = [0, 2, 4, 5, 6, 7, 3, 1]
+    const room = width - visibleWidth(right) - 1
+    const kept = new Set(segments.map((_, i) => i))
+    const render = () =>
+      order
+        .filter(i => i < segments.length && kept.has(i))
+        .map(i => segments[i].text)
+        .join(c.faint(` ${g.sep} `))
+
+    while (kept.size > 1 && visibleWidth(render()) > room) {
+      let worst = -1
+      for (const i of kept) if (worst === -1 || segments[i].keep < segments[worst].keep) worst = i
+      kept.delete(worst)
+    }
+
+    return split(render(), right, width)
   }
 
   // Rendering a block is the expensive part (wrapping + markdown), and during
@@ -1006,7 +1038,12 @@ export async function runFullscreenTui(
       const b = list[i]
       if (b.kind !== 'tool') continue
       if (b.expanded) return true
-      if (list === blocks && focusedTool !== null && blocks[focusedTool] === b) return true
+      // O foco só desfaz a dobra quando veio do teclado: aí a linha precisa
+      // estar desenhada para o marcador `❯` ter onde aparecer. Vindo de clique,
+      // quem manda é o `expanded` — o clique já escolheu abrir ou fechar.
+      if (list === blocks && focusHoldsFoldOpen && focusedTool !== null && blocks[focusedTool] === b) {
+        return true
+      }
     }
     return false
   }
@@ -2762,7 +2799,14 @@ export async function runFullscreenTui(
     const block = blocks[target]
     if (block?.kind !== 'tool' || !block.preview) return
     block.expanded = !block.expanded
-    if (index !== undefined) focusedTool = index
+    if (index !== undefined) {
+      focusedTool = index
+      // Um clique já disse o que queria pelo `expanded`. O foco continua ali —
+      // é o que faz o `ctrl+r` seguinte agir neste bloco — mas deixa de ser
+      // motivo para manter um lote aberto: sem isto, recolher um lote clicado
+      // não trazia a dobra de volta, e nenhuma tecla trazia.
+      focusHoldsFoldOpen = false
+    }
     dirty = true
   }
 
@@ -2782,6 +2826,8 @@ export async function runFullscreenTui(
           : tools.length - 1
         : (current + delta + tools.length) % tools.length
     focusedTool = tools[next]
+    // Navegação por teclado precisa da linha desenhada para mostrar onde está.
+    focusHoldsFoldOpen = true
     const block = blocks[focusedTool]
     statusMessage =
       block?.kind === 'tool'
@@ -4709,6 +4755,52 @@ export async function runFullscreenTui(
       case 'rewind':
         toggleChangesView()
         return 'handled'
+
+      // Dois interruptores que quase sempre são acionados juntos: quem quer
+      // orquestração quer o modelo pensando mais, e vice-versa. O comando faz os
+      // dois no escopo da sessão — nada é gravado em arquivo de config.
+      case 'ultracode': {
+        const desligar = ['off', 'nao', 'não', 'false', '0'].includes(arg.trim().toLowerCase())
+        const { registerTools } = await import('../tools/index.ts')
+
+        if (desligar) {
+          session.config.effort = ultracodeAnterior?.effort
+          session.config.workflows = {
+            ...(session.config.workflows ?? {}),
+            enabled: ultracodeAnterior?.workflows ?? false,
+          }
+          ultracodeAnterior = null
+          registerTools(session)
+          session.bootstrapped = false
+          say('ultracode desligado — effort e workflows voltaram ao que estavam')
+          return 'handled'
+        }
+
+        // A config do projeto pode ter desligado workflows de propósito. Ligar
+        // por baixo dos panos seria passar por cima de uma decisão que alguém
+        // escreveu num arquivo; avisar deixa a escolha com quem pode fazê-la.
+        const desligadoNaConfig = configuredWorkflowsEnabled === false
+        if (desligadoNaConfig) {
+          push({
+            kind: 'error',
+            text:
+              'ultracode precisa de workflows habilitados, e a config deste projeto os desliga ' +
+              '("workflows": { "enabled": false }). Ligue lá, ou use /workflows on para esta sessão.',
+          })
+          return 'handled'
+        }
+
+        ultracodeAnterior ??= {
+          effort: session.config.effort,
+          workflows: session.config.workflows?.enabled === true,
+        }
+        session.config.effort = 'xhigh'
+        session.config.workflows = { ...(session.config.workflows ?? {}), enabled: true }
+        registerTools(session)
+        session.bootstrapped = false
+        say('ultracode ligado — effort xhigh e orquestração por workflow, só nesta sessão')
+        return 'handled'
+      }
 
       case 'workflows': {
         // Bare `/workflows` opens the live view, as Claude Code does; the toggle

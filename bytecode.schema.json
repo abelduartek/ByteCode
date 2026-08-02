@@ -388,7 +388,16 @@
         },
         "maxAgents": {
           "type": "number",
-          "description": "Hard stop for runaway loops. Defaults to 1000."
+          "description": "Hard stop for runaway loops. Defaults to 50."
+        },
+        "sizeGuideline": {
+          "enum": [
+            "small",
+            "medium",
+            "large",
+            "unrestricted"
+          ],
+          "description": "Size the model is told to aim for: small under 5 agents, medium (default) under 15, large under 50, unrestricted sends no guideline. Advisory — maxAgents is the hard stop."
         },
         "tokenBudget": {
           "type": "number",

@@ -1,6 +1,6 @@
 {
   "name": "bytecode-ai",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "type": "module",
   "description": "ByteCode — multi-provider agent harness with Claude Code semantics and an opencode-style provider layer",
   "keywords": [
@@ -28,7 +28,8 @@
   },
   "files": [
     "bin",
-    "dist"
+    "dist",
+    "workflows"
   ],
   "engines": {
     "node": ">=22.6"

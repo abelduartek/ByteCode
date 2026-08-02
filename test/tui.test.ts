@@ -1075,6 +1075,81 @@ log('--- alt+v anexa imagem do clipboard ---')
 // alternativa é nossa embaralha o quadro: o desenho é por diferença, e texto que
 // aparece por fora dele empurra as linhas sem que o diferencial saiba. Tem de
 // virar conteúdo do transcript, não sujeira na tela.
+// Expandir um lote e recolher tem de ser a mesma tecla, indo e voltando. O
+// clique define foco E expandido, e `opened()` olha os dois — soltar só um
+// deixava a dobra desfeita para sempre.
+// Orquestração gasta a frota inteira sem pedir passo a passo, então "está
+// ligada?" não pode depender de tentar usar e ver o que acontece.
+// Dois interruptores acionados juntos, e a guarda que impede passar por cima de
+// uma decisão escrita na config do projeto.
+log('--- /ultracode liga os dois, e devolve ---')
+{
+  const efeitoAntes = session.config.effort
+  key('/ultracode')
+  key('\r')
+  await tick(300)
+  check('liga effort xhigh', session.config.effort === 'xhigh', String(session.config.effort))
+  check('e liga workflows', session.config.workflows?.enabled === true, JSON.stringify(session.config.workflows))
+  check('a barra reflete', has('wf on'), JSON.stringify(lines().slice(-2)))
+
+  key('/ultracode off')
+  key('\r')
+  await tick(300)
+  check('desligar devolve o effort anterior', session.config.effort === efeitoAntes, String(session.config.effort))
+  check('e devolve workflows', session.config.workflows?.enabled === false, JSON.stringify(session.config.workflows))
+}
+
+log('--- a barra diz se workflows está ligado ---')
+{
+  check('desligado aparece como off', has('wf off'), JSON.stringify(lines().slice(-2)))
+
+  const { registerTools } = await import(`${R}/tools/index.ts`)
+  session.config.workflows = { ...(session.config.workflows ?? {}), enabled: true }
+  registerTools(session)
+  session.emit({ type: 'notice', text: 'workflows ligados' })
+  await tick(200)
+  check('ligado aparece como on', has('wf on'), JSON.stringify(lines().slice(-2)))
+
+  session.config.workflows = { ...(session.config.workflows ?? {}), enabled: false }
+  registerTools(session)
+  session.emit({ type: 'notice', text: 'workflows desligados' })
+  await tick(200)
+  check('e volta para off', has('wf off'), JSON.stringify(lines().slice(-2)))
+}
+
+log('--- lote expande e recolhe pelo mesmo caminho ---')
+{
+  session.emit({ type: 'tool-start', id: 'r1', name: 'Bash', summary: 'b', subject: 'echo um', step: 40 } as never)
+  session.emit({ type: 'tool-start', id: 'r2', name: 'Bash', summary: 'b', subject: 'echo dois', step: 40 } as never)
+  await tick(160)
+  session.emit({ type: 'tool-end', id: 'r1', name: 'Bash', ok: true, preview: 'um\num' })
+  session.emit({ type: 'tool-end', id: 'r2', name: 'Bash', ok: true, preview: 'dois\ndois' })
+  await tick(200)
+  const dobrado = () => lines().some(l => l.includes('rodando 2 comandos'))
+  check('o lote dobra sozinho', dobrado(), JSON.stringify(lines().slice(-5)))
+
+  key('\x12') // ctrl+r
+  await tick(200)
+  check('ctrl+r abre o lote', !dobrado() && has('echo dois'), JSON.stringify(lines().slice(-6)))
+
+  key('\x12')
+  await tick(200)
+  check('ctrl+r recolhe de volta', dobrado(), JSON.stringify(lines().slice(-6)))
+
+  // O caminho do clique é o que quebrava: ele define o foco, e o foco sozinho
+  // mantinha o lote aberto mesmo depois de recolher.
+  const linhaDoLote = lines().findIndex(l => l.includes('rodando 2 comandos'))
+  if (linhaDoLote >= 0) {
+    key(`${ESC}[<0;5;${linhaDoLote + 1}M`)
+    key(`${ESC}[<0;5;${linhaDoLote + 1}m`)
+    await tick(200)
+    check('clique abre o lote', !dobrado(), JSON.stringify(lines().slice(-6)))
+    key('\x12')
+    await tick(200)
+    check('e ctrl+r recolhe mesmo tendo sido aberto por clique', dobrado(), JSON.stringify(lines().slice(-6)))
+  }
+}
+
 log('--- stderr de terceiros não escapa para a tela ---')
 {
   const antes = screen.join('\n')
@@ -1941,12 +2016,15 @@ log('--- sequência longa da mesma tool dobra numa linha ---')
   check('clicar abre a sequência', !has('8 chamadas'), JSON.stringify(lines().slice(-16)))
   check('e os padrões do meio voltam', has('**/p5*'), JSON.stringify(lines().slice(-16)))
 
-  // Depois de aberta ela FICA aberta enquanto o foco estiver dentro: quem
-  // entrou na sequência quer ver a sequência. Ela volta a dobrar no turno
-  // seguinte, quando o foco é limpo.
+  // E fecha pelo mesmo gesto que abriu. A regra anterior era que a sequência
+  // ficava aberta enquanto o foco estivesse dentro, voltando a dobrar só no
+  // turno seguinte — na prática isso deixava quem abriu sem nenhuma tecla para
+  // desfazer, que foi o relato de uso. Hoje o `expanded` é quem manda no caminho
+  // do clique; o foco continua onde estava, para o `ctrl+r` seguinte agir aqui.
   key('\x12')
   await tick(300)
-  check('continua aberta com o foco dentro', has('**/p5*'), JSON.stringify(lines().slice(-12)))
+  check('ctrl+r fecha a sequência aberta por clique', has('8 chamadas'), JSON.stringify(lines().slice(-12)))
+  check('e os padrões do meio somem de novo', !has('**/p5*'), JSON.stringify(lines().slice(-12)))
 }
 
 log('--- ctrl+y alterna o layout do diff ---')

@@ -202,8 +202,18 @@ export type Config = {
     enabled?: boolean
     /** Subagents running at once. Defaults to min(8, cores - 2). */
     maxConcurrency?: number
-    /** Hard stop for runaway loops. Defaults to 1000. */
+    /** Hard stop for runaway loops. Defaults to 50. */
     maxAgents?: number
+    /**
+     * How many agents the model is *told* to aim for, which is a different
+     * question from where the run dies. `maxAgents` is the emergency brake;
+     * this is the cost signal, appended to the tool's description so the model
+     * writes a workflow of the right size in the first place.
+     *
+     * `small` under 5, `medium` (default) under 15, `large` under 50,
+     * `unrestricted` sends no guideline at all.
+     */
+    sizeGuideline?: 'small' | 'medium' | 'large' | 'unrestricted'
     /**
      * Output-token ceiling per run. A hard stop, not a hint: the step that would
      * cross it fails instead of running. Unset means no ceiling.

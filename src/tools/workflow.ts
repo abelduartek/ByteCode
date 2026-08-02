@@ -50,13 +50,36 @@ export const workflowTool: ToolDefinition = {
     additionalProperties: false,
   },
   subject: input => String(input.name ?? input.scriptPath ?? 'inline script'),
+  /**
+   * O que o usuário lê antes de dizer sim.
+   *
+   * Aprovar um `exec` sabendo só o nome do workflow é aprovar no escuro: o que
+   * está sendo autorizado é uma frota de subagentes, e o número deles e as fases
+   * em que rodam são o que decide se vale. O dado já existe em `meta.phases` e
+   * já é lido **sem executar o script** — `extractMeta` usa o leitor de literal
+   * justamente para isso. Só faltava mostrar.
+   */
   summary: input => {
     const source = input.script ?? ''
+    let meta: ReturnType<typeof extractMeta> | null = null
     try {
-      return `workflow ${extractMeta(String(source)).name}`
+      meta = extractMeta(String(source))
     } catch {
       return `workflow ${String(input.name ?? input.scriptPath ?? '')}`
     }
+
+    const cabecalho = `workflow ${meta.name}`
+    const fases = meta.phases ?? []
+    if (fases.length === 0) return cabecalho
+
+    const linhas = fases.map(
+      (fase, i) => `  ${i + 1} ${fase.title}${fase.detail ? ` — ${fase.detail}` : ''}`,
+    )
+    return [
+      cabecalho,
+      `Vai criar subagentes em ${fases.length} fase${fases.length === 1 ? '' : 's'}:`,
+      ...linhas,
+    ].join('\n')
   },
   async execute(input, ctx) {
     let script = typeof input.script === 'string' ? input.script : undefined

@@ -139,7 +139,13 @@ const compactionConfig = obj({
 const workflowsConfig = obj({
   enabled: bool,
   maxConcurrency: { ...num, description: 'Subagents at once. Defaults to min(8, cores - 2).' },
-  maxAgents: { ...num, description: 'Hard stop for runaway loops. Defaults to 1000.' },
+  maxAgents: { ...num, description: 'Hard stop for runaway loops. Defaults to 50.' },
+  sizeGuideline: {
+    enum: ['small', 'medium', 'large', 'unrestricted'],
+    description:
+      'Size the model is told to aim for: small under 5 agents, medium (default) under 15, ' +
+      'large under 50, unrestricted sends no guideline. Advisory — maxAgents is the hard stop.',
+  },
   tokenBudget: { ...num, description: 'Output-token ceiling per run. A hard stop, not a hint.' },
 })
 

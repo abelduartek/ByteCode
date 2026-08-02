@@ -19,14 +19,20 @@ const argv = process.argv.slice(2)
 
 // Two shapes, and the difference is where this copy came from.
 //
-// From the repository there is only `src/`, and the Node runtime erases the
-// types on load — no build, edit and run. Installed from npm the package ships
-// `dist/`, because Node refuses to strip types under `node_modules`
+// From the repository the runtime erases the types on load — no build, edit and
+// run. Installed from npm the package ships `dist/`, because Node refuses to
+// strip types under `node_modules`
 // (`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`) and a published CLI lives
 // exactly there.
-const built = existsSync(join(root, 'dist', 'index.js'))
-const dir = built ? 'dist' : 'src'
-const ext = built ? '.js' : '.ts'
+//
+// `src/` wins when both exist. A checkout that once ran `npm pack` has a `dist/`
+// sitting next to it, and preferring it means every later edit to `src/` is
+// silently ignored — the CLI keeps running the build from whenever the tarball
+// was made.
+const fromSource = existsSync(join(root, 'src', 'index.ts'))
+const dir = fromSource ? 'src' : 'dist'
+const ext = fromSource ? '.ts' : '.js'
+const built = !fromSource
 const entry = join(root, dir, `index${ext}`)
 
 /**

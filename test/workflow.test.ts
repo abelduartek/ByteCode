@@ -130,6 +130,38 @@ const resumed = await runWorkflow(session, { script, args: { items: ['x', 'y'] }
 check('resume devolve o mesmo resultado', JSON.stringify(resumed.result) === JSON.stringify(run.result), '')
 check('resume nao chamou o modelo de novo', mock.stats.calls === before, `${mock.stats.calls - before} chamadas novas`)
 
+// A aprovação vale para o texto que foi lido, não para a intenção dele. Retomar
+// reaproveita passos já pagos; se o corpo pudesse mudar no meio, o "sim" do
+// usuário passaria a cobrir um script que ele nunca viu.
+console.log('--- o resume exige o mesmo script ---')
+{
+  check('journal abre declarando o hash',
+    entries[0]?.type === 'begin' && typeof entries[0]?.sha256 === 'string' && entries[0].sha256.length === 64,
+    JSON.stringify(entries[0]))
+
+  const alterado = `${script}\n// uma linha a mais muda o hash`
+  let recusa = ''
+  try {
+    await runWorkflow(session, { script: alterado, args: { items: ['x', 'y'] }, resumeFromRunId: run.runId })
+  } catch (err) {
+    recusa = err instanceof Error ? err.message : String(err)
+  }
+  check('script alterado não retoma', recusa.includes('mudou desde que o run'), recusa)
+  check('e a recusa diz o que fazer', recusa.includes('resumeFromRunId'), recusa)
+
+  // Journal de antes desta verificação não tem a linha `begin`; retomar
+  // continua valendo, senão a mudança quebraria runs já gravados no disco.
+  const semBegin = run.journalPath.replace(/\.jsonl$/, '-legado.jsonl')
+  const runIdLegado = `${run.runId}-legado`
+  await fsp.writeFile(semBegin, journal.split('\n').filter(l => l && !l.includes('"begin"')).join('\n') + '\n', 'utf8')
+  const legado = await runWorkflow(session, {
+    script: alterado,
+    args: { items: ['x', 'y'] },
+    resumeFromRunId: runIdLegado,
+  })
+  check('journal antigo, sem hash, ainda retoma', legado.runId !== run.runId, legado.runId)
+}
+
 console.log('--- falha do script ---')
 {
   let message = ''
@@ -251,6 +283,60 @@ return { total: budget.total, restante: budget.remaining() }
   const free = semTeto.result as any
   check('sem teto total e null', free.total === null, JSON.stringify(free))
   check('sem teto remaining e Infinity', free.restante === Infinity, JSON.stringify(free))
+}
+
+// O que aparece no pedido de permissão é o que o usuário tem para decidir. Nome
+// sozinho é aprovar no escuro: o que está sendo autorizado é uma frota.
+console.log('--- a aprovação descreve as fases ---')
+{
+  const { workflowTool } = await import(`${R}/tools/workflow.ts`)
+  const comFases = workflowTool.summary!({
+    script: `export const meta = {
+  name: 'revisao',
+  description: 'revisa o diff',
+  phases: [
+    { title: 'Review', detail: '7 revisores' },
+    { title: 'Verify' },
+  ],
+}
+`,
+  })
+  check('nomeia o workflow', comFases.includes('workflow revisao'), comFases)
+  check('diz quantas fases', comFases.includes('2 fases'), comFases)
+  check('lista as fases na ordem', /1 Review — 7 revisores[\s\S]*2 Verify/.test(comFases), comFases)
+
+  const semFases = workflowTool.summary!({
+    script: `export const meta = { name: 'simples', description: 'sem fases' }`,
+  })
+  check('sem fases declaradas continua uma linha', semFases === 'workflow simples', semFases)
+
+  // Um script que nem parseia não pode derrubar o pedido de permissão.
+  const quebrado = workflowTool.summary!({ script: 'não é um workflow', name: 'algum' })
+  check('script ilegível cai no nome', quebrado.includes('algum'), quebrado)
+}
+
+// O workflow que vem junto. Sem nenhum exemplo, todo mundo reinventa o padrão
+// adversarial — e erra a assimetria, que é a parte que importa.
+console.log('--- workflow embutido ---')
+{
+  const { listWorkflows, extractMeta } = await import(`${R}/core/workflow.ts`)
+  const { promises: fsp2 } = await import('node:fs')
+
+  const achados = await listWorkflows(S)
+  const embutido = achados.find((w: any) => w.name === 'code-review')
+  check('code-review é descoberto de qualquer diretório', embutido !== undefined,
+    JSON.stringify(achados.map((w: any) => w.name)))
+
+  if (embutido) {
+    const src = await fsp2.readFile(embutido.file, 'utf8')
+    const meta = extractMeta(src)
+    check('declara as fases, então a aprovação as mostra', (meta.phases ?? []).length === 2,
+      JSON.stringify(meta.phases))
+    // A regra de 2 de 3 é a decisão de projeto do arquivo: o default é manter o
+    // achado, porque deixar passar defeito custa mais que ler um falso positivo.
+    check('mantém o achado quando a maioria não refuta', src.includes('refutacoes < 2'), '')
+    check('usa pipeline, não uma barreira por fase', src.includes('await pipeline('), '')
+  }
 }
 
 await session.mcp.close()
