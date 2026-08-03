@@ -21,6 +21,7 @@ import { color, symbols } from './ansi.ts'
 
 export async function runTui(session: Session): Promise<void> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
+  if (process.stdout.isTTY) process.stdout.write(`\x1b]0;${session.titleOverride?.trim() || 'ByteCode'}\x07`)
 
   let streaming = false
   let lineOpen = false
@@ -317,6 +318,7 @@ async function handleCommand(
           `${color.bold('/leadtime')}        time, tools and tokens for the last turn`,
           `${color.bold('/sessions')}        list saved sessions for this directory`,
           `${color.bold('/resume')} #id      reopen a saved session`,
+          `${color.bold('/rename')} [title]  rename this session (empty shows the current title)`,
           `${color.bold('/compact')} [foco]  summarise history now, keeping recent turns`,
           `${color.bold('/clear')}           reset conversation context`,
           `${color.bold('/transcript')}      path of the session transcript`,
@@ -513,6 +515,18 @@ async function handleCommand(
           ? color.green(`compacted: ~${result.before} -> ~${result.after} tokens\n`)
           : color.yellow(`not compacted: ${result.reason}\n`),
       )
+      return 'handled'
+    }
+
+    case 'rename': {
+      const name = arg.trim()
+      if (!name) {
+        write(`${session.titleOverride?.trim() || '(sem título)'}\n`)
+        return 'handled'
+      }
+      session.titleOverride = name.slice(0, 72)
+      if (process.stdout.isTTY) write(`\x1b]0;${session.titleOverride}\x07`)
+      write(color.green(`renamed → ${session.titleOverride}\n`))
       return 'handled'
     }
 

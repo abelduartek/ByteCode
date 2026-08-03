@@ -145,6 +145,8 @@ export class Session {
   forkedFrom?: string
   /** Message count copied at fork time, for "forked at turn N". */
   forkedAtMessage?: number
+  /** Set by `/rename`. Wins over the title derived from the first message. */
+  titleOverride?: string
   /**
    * Primary agent the session is acting as, opencode-style. Null means the plain
    * harness behaviour. Switching one replaces the prompt, may switch the model,
@@ -220,6 +222,7 @@ export class Session {
     // would silently promote every fork to a root next time the tree is drawn.
     this.forkedFrom = state.parentId
     this.forkedAtMessage = state.forkedAtMessage
+    this.titleOverride = state.titleOverride
     // The restored history already contains the bootstrap reminders, so sending
     // them again would duplicate every roster in the context.
     this.bootstrapped = true

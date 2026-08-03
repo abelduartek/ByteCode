@@ -33,6 +33,8 @@ export type SessionState = {
   parentId?: string
   /** Messages copied from the parent at fork time, for "forked at turn N". */
   forkedAtMessage?: number
+  /** Set by `/rename`. Wins over the title derived from the first message. */
+  titleOverride?: string
 }
 
 export type SessionMeta = {
@@ -218,7 +220,7 @@ export async function saveSessionState(
     id: state.id,
     cwd: state.cwd,
     modelRef: state.modelRef,
-    title: titleFrom(state.messages),
+    title: state.titleOverride?.trim() || titleFrom(state.messages),
     createdAt,
     updatedAt: now,
     turns: countTurns(state.messages),

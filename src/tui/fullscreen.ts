@@ -83,6 +83,14 @@ const PASTE_ON = `${CSI}?2004h`
 const PASTE_OFF = `${CSI}?2004l`
 const PASTE_START = `${CSI}200~`
 const PASTE_END = `${CSI}201~`
+const OSC = `${ESC}]`
+const BEL = String.fromCharCode(7)
+/** OSC 0: sets both the terminal window title and the tab/taskbar label. */
+function titleSequence(text: string): string {
+  // Control characters would break out of the OSC string; a title is display
+  // text, never a place to smuggle escape codes through.
+  return `${OSC}0;${text.replace(/[\x00-\x1f]/g, ' ')}${BEL}`
+}
 
 /**
  * How long an `ESC` waits for the rest of its sequence before it is taken to be
@@ -324,7 +332,7 @@ type Modal =
       error?: string
       resolve: (values: Record<string, string> | null) => void
     }
-  | { kind: 'busy'; title: string; message: string }
+  | { kind: 'busy'; title: string; message: string; since: number }
   /** Read-only list of what the model broke the work into. */
   | { kind: 'tasks' }
   /** Read-only list of MCP servers and what each one exposes. */
@@ -356,6 +364,7 @@ const BUILTIN_COMMANDS: { name: string; hint: string }[] = [
   { name: 'fork', hint: 'continua daqui numa sessão nova (ctrl+s vê a árvore)' },
   { name: 'tree', hint: 'árvore de sessões e forks (ctrl+s)' },
   { name: 'sessions', hint: 'lista as sessões deste projeto' },
+  { name: 'rename', hint: '[título] renomeia a sessão (vazio mostra o atual)' },
   { name: 'context', hint: 'uso da janela de contexto' },
   { name: 'context-all', hint: 'detalha o contexto: setup, skills, mcp, tools' },
   { name: 'leadtime', hint: 'tempo, tools e tokens do último turno' },
@@ -464,6 +473,8 @@ export async function runFullscreenTui(
   let blinkOn = true
   let interrupts = 0
   let exiting = false
+  /** Last title written to the terminal tab, so an unchanged one is not rewritten every turn. */
+  let lastTitle = ''
   let statusMessage = ''
   let completionIndex = 0
   let themeVersion = 0
@@ -1882,7 +1893,11 @@ export async function runFullscreenTui(
       ]
     } else if (current.kind === 'busy') {
       title = c.info(strong(current.title))
-      lines = [` ${c.info(g.spinner[spinner % g.spinner.length])} ${c.fg(current.message)}`]
+      const secs = Math.max(0, Math.round((Date.now() - current.since) / 1000))
+      lines = [
+        ` ${c.info(g.spinner[spinner % g.spinner.length])} ${c.fg(current.message)}`,
+        ` ${busyBar(spinner, Math.min(BUSY_BAR_WIDTH, inner - 6))}  ${c.faint(`${secs}s`)}`,
+      ]
     } else if (current.kind === 'tasks') {
       const groups = todoGroups(session)
       const todos = groups.flatMap(gr => gr.todos)
@@ -2327,7 +2342,7 @@ export async function runFullscreenTui(
   }
 
   async function withBusyModal<T>(title: string, message: string, work: () => Promise<T>): Promise<T> {
-    modal = { kind: 'busy', title, message }
+    modal = { kind: 'busy', title, message, since: Date.now() }
     dirty = true
     try {
       return await work()
@@ -2489,6 +2504,7 @@ export async function runFullscreenTui(
         for (const agent of agents.values()) agent.done = true
         agentIndex = -1
         if (event.stats) statusMessage = summarizeTurn(session, event.stats)
+        syncTerminalTitle()
         dirty = true
         break
     }
@@ -4088,6 +4104,7 @@ export async function runFullscreenTui(
         messages: session.messages,
         parentId,
         forkedAtMessage: atMessage,
+        titleOverride: session.titleOverride,
       })
     } catch (err) {
       push({ kind: 'error', text: `fork criado mas não pôde ser salvo: ${describeError(err)}` })
@@ -4104,14 +4121,53 @@ export async function runFullscreenTui(
     dirty = true
   }
 
-  /** Título da sessão atual, do primeiro texto de usuário que ela tiver. */
+  /**
+   * Título da sessão atual: o que `/rename` gravou, senão o primeiro texto de
+   * usuário que ela tiver.
+   */
   function titleOfCurrent(): string {
+    if (session.titleOverride?.trim()) return session.titleOverride.trim()
     for (const message of session.messages) {
       if (message.role !== 'user') continue
       const text = visibleUserText(message)
       if (text) return text.slice(0, 72)
     }
     return ''
+  }
+
+  const BUSY_BAR_WIDTH = 24
+
+  /**
+   * A wave crossing the bar, so the eye has something moving without the UI
+   * claiming to know how far along an operation is. `/compact` and `/connect`
+   * have no total to measure against — a fill bar would have to invent a
+   * percentage, same reasoning as the splash screen's bar (`splash.ts`).
+   */
+  function busyBar(frame: number, width: number): string {
+    const [full, mid, empty] = ascii ? ['#', '=', '-'] : ['█', '▓', '░']
+    const head = frame % (width + 8)
+    let out = ''
+    for (let i = 0; i < width; i++) {
+      const d = head - i
+      if (d === 0 || d === 1) out += c.accent(full)
+      else if (d === 2 || d === 3) out += c.dim(mid)
+      else if (d === 4) out += c.faint(mid)
+      else out += c.faint(empty)
+    }
+    return out
+  }
+
+  /**
+   * Mirrors the session title into the terminal tab, so a wall of "powershell.exe"
+   * tabs becomes tabs that say what each one is doing. Skips the write when the
+   * title has not changed — a terminal that redraws its tab bar on every OSC
+   * sequence would otherwise flicker on every 80 ms tick.
+   */
+  function syncTerminalTitle(): void {
+    const title = titleOfCurrent() || 'ByteCode'
+    if (title === lastTitle) return
+    lastTitle = title
+    out.write(titleSequence(title))
   }
 
   async function disconnectFlow(preset?: string): Promise<void> {
@@ -4199,6 +4255,7 @@ export async function runFullscreenTui(
 
   const releaseStderr = captureStderr()
   out.write(ALT_ON + CURSOR_HIDE + MOUSE_ON + PASTE_ON + CLEAR_SCREEN)
+  syncTerminalTitle()
   process.stdin.setRawMode?.(true)
   process.stdin.resume()
   process.stdin.on('data', onKey)
@@ -4878,6 +4935,32 @@ export async function runFullscreenTui(
         blocks.push({ kind: 'splash' })
         dirty = true
         return 'handled'
+
+      case 'rename': {
+        const name = (arg ?? '').trim()
+        if (!name) {
+          say(titleOfCurrent() ? `título atual: ${titleOfCurrent()}` : 'uso: /rename <novo título>')
+          return 'handled'
+        }
+        session.titleOverride = name.slice(0, 72)
+        syncTerminalTitle()
+        try {
+          await saveSessionState(session.config, {
+            id: session.transcript.sessionId,
+            cwd: session.cwd,
+            modelRef: session.modelRef,
+            messages: session.messages,
+            parentId: session.forkedFrom,
+            forkedAtMessage: session.forkedAtMessage,
+            titleOverride: session.titleOverride,
+          })
+        } catch (err) {
+          push({ kind: 'error', text: `renomeado mas não pôde ser salvo: ${describeError(err)}` })
+          return 'handled'
+        }
+        say(`sessão renomeada: ${session.titleOverride}`)
+        return 'handled'
+      }
 
       case 'transcript':
         say(session.transcript.file)

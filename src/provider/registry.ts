@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url'
 import type { Config, ProviderConfig, ResolvedModel } from '../config/types.ts'
 import type { CachePolicy } from '../core/cache.ts'
 import { cachingFetch } from './promptcache.ts'
+import { parallelToolsFetch } from './paralleltools.ts'
 import { keyOf, openCodeAuthPaths, readAuth, readAuthFile } from './auth.ts'
 import { loadCatalog, toProviderConfig } from './catalog.ts'
 import { stateFiles } from '../util/paths.ts'
@@ -198,6 +199,15 @@ export async function createLanguageModel(
   // why `providerOptions` cannot carry it on an OpenAI-shaped surface.
   if (opts.cache?.style === 'wire') {
     options.fetch = cachingFetch(options.fetch as never, opts.cache)
+  }
+  // The AI SDK's own tool-calling is provider-agnostic and the model decides on
+  // its own whether to batch — but some OpenAI-compatible proxies default
+  // `parallel_tool_calls` to false or omit it, which serialises every
+  // independent call the model would otherwise have emitted together. See
+  // `paralleltools.ts`: not exposed as a provider option, so it goes in through
+  // the same fetch-wrapping the cache breakpoint uses.
+  if (npmName === DEFAULT_NPM) {
+    options.fetch = parallelToolsFetch(options.fetch as never)
   }
   // An OpenAI-compatible server does not report token usage on a *streamed*
   // response unless the request asks for it, and the SDK only asks when told to

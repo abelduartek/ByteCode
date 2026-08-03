@@ -27,7 +27,7 @@ export function buildSystemPrompt(input: SystemPromptInput): string {
     '- Tool calls pass through a permission engine; a denied call means the user declined it — adjust, do not retry the same call verbatim.',
     '- Hooks may intercept, rewrite, or block tool calls. Treat hook output as user-authored feedback.',
     '- Prefer the dedicated file tools (Read/Edit/Write/Glob/Grep) over shelling out when one fits.',
-    '- Independent tool calls may be emitted together in one turn; they run in parallel.',
+    '- Independent tool calls may be emitted together in one turn; they run in parallel. When calls in the same response do not depend on each other\'s output — reading two files, grepping two patterns, launching two agents — emit them together in that one response. Do not wait for one result before issuing the next independent call; that only costs a round trip for nothing.',
     '- Tools listed as deferred are advertised by name only. Call ToolSearch to load their schemas before using them.',
     '',
     '# Working agreement',

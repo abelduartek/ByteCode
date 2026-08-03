@@ -190,6 +190,7 @@ export async function runTurn(
           tokenBaseline: session.tokenBaseline,
           parentId: session.forkedFrom,
           forkedAtMessage: session.forkedAtMessage,
+          titleOverride: session.titleOverride,
         })
       } catch (err) {
         session.emit({ type: 'notice', text: `sessão não pôde ser salva: ${describeError(err)}` })

@@ -27,6 +27,7 @@ const { registerTools } = await import(`${R}/tools/index.ts`)
 const { runTurn } = await import(`${R}/core/loop.ts`)
 const { cachePolicy, cachedSystem, withCacheControl } = await import(`${R}/core/cache.ts`)
 const { markRequestBody, cachingFetch } = await import(`${R}/provider/promptcache.ts`)
+const { markParallelToolCalls, parallelToolsFetch } = await import(`${R}/provider/paralleltools.ts`)
 const { HookRunner } = await import(`${R}/core/hooks.ts`)
 const { loadCommands, expandCommandBody } = await import(`${R}/assets/index.ts`)
 const mock = await import(fixtureUrl('mock-parity.mjs'))
@@ -201,6 +202,69 @@ log('--- o fetch do provider aplica a marcação ---')
   visto = ''
   await wrapped('http://x', undefined as any)
   check('request sem init não quebra', visto === '', visto)
+}
+
+log('--- parallel_tool_calls no corpo do request (openai-compatible) ---')
+{
+  const comTools = JSON.stringify({
+    model: 'x',
+    tools: [{ type: 'function', function: { name: 'Read' } }],
+    messages: [{ role: 'user', content: 'oi' }],
+  })
+  const out = JSON.parse(markParallelToolCalls(comTools))
+  check('liga quando há tools', out.parallel_tool_calls === true, JSON.stringify(out))
+
+  const semTools = JSON.stringify({ model: 'x', messages: [] })
+  check('sem tools passa reto', markParallelToolCalls(semTools) === semTools, '')
+
+  const toolsVazio = JSON.stringify({ model: 'x', tools: [], messages: [] })
+  check('tools vazio passa reto', markParallelToolCalls(toolsVazio) === toolsVazio, '')
+
+  const jaDefinido = JSON.stringify({
+    tools: [{ type: 'function' }],
+    parallel_tool_calls: false,
+  })
+  check('valor já presente não é sobrescrito',
+    markParallelToolCalls(jaDefinido) === jaDefinido, '')
+
+  // Regra idêntica ao promptcache: nunca quebrar o request.
+  check('corpo que não é JSON passa reto', markParallelToolCalls('nao-e-json') === 'nao-e-json', '')
+  check('corpo sem tools nem messages passa reto',
+    markParallelToolCalls('{"model":"x"}') === '{"model":"x"}', '')
+
+  let visto = ''
+  const fake = async (_input: unknown, init: any) => {
+    visto = String(init?.body ?? '')
+    return new Response('ok')
+  }
+  const wrapped = parallelToolsFetch(fake as any)
+
+  await wrapped('http://x', { body: comTools } as any)
+  check('o fetch aplica a marcação', visto.includes('"parallel_tool_calls":true'), visto)
+
+  visto = ''
+  const buffer = Buffer.from('binario')
+  await wrapped('http://x', { body: buffer } as any)
+  check('corpo não-string passa intacto', visto === 'binario', visto)
+
+  visto = ''
+  await wrapped('http://x', undefined as any)
+  check('request sem init não quebra', visto === '', visto)
+}
+
+log('--- o registry liga parallel_tool_calls só no default openai-compatible ---')
+{
+  const { createLanguageModel } = await import(`${R}/provider/registry.ts`)
+
+  // Provider mock deste arquivo: `npm` aponta para o fixture, não para
+  // "@ai-sdk/openai-compatible" — não deve ganhar o fetch.
+  const mockResolved: any = {
+    providerId: 'mock', modelKey: 'tiny', modelId: 'tiny',
+    provider: config.provider!.mock, model: {},
+  }
+  await createLanguageModel(mockResolved, {})
+  check('provider fora do default real não ganha o fetch',
+    mock.built.options?.fetch === undefined, String(typeof mock.built.options?.fetch))
 }
 
 log('--- o loop usa a política ---')
