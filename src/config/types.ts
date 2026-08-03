@@ -53,6 +53,12 @@ export type ProviderConfig = {
   env?: string[]
   /** Passed to the provider factory (baseURL, apiKey, headers, ...). */
   options?: Record<string, unknown>
+  /**
+   * Seconds of silence allowed between response chunks before giving up.
+   * Default 300 (undici's own default) — raise it for a provider that streams
+   * a long single completion with pauses longer than that between chunks.
+   */
+  timeout?: number
   models: Record<string, ModelConfig>
 }
 

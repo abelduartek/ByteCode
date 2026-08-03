@@ -146,6 +146,10 @@ de ganhar da chave que você digitou.
 Valores podem ser montados de fora do arquivo: `{env:VAR}`, `{file:~/caminho}` e
 `{base64:...}`, resolvidos nessa ordem.
 
+Um provider aceita `"timeout": 600` (segundos de silêncio entre chunks da resposta antes de
+desistir — padrão 300, o do próprio undici) para um proxy que segura uma resposta longa por
+mais tempo do que isso entre pedaços.
+
 ## Permissões
 
 A sintaxe é `Tool(padrão)` e a precedência é **deny > ask > allow**. Sem regra que case, o

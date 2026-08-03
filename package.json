@@ -48,7 +48,8 @@
     "@ai-sdk/anthropic": "^4.0.23",
     "@ai-sdk/openai-compatible": "^3.0.16",
     "@modelcontextprotocol/sdk": "^1.30.0",
-    "ai": "^7.0.41"
+    "ai": "^7.0.41",
+    "undici": "^8.10.0"
   },
   "optionalDependencies": {
     "@vscode/ripgrep": "^1.15.14"

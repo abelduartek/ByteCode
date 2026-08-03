@@ -5,6 +5,7 @@ import type { Config, ProviderConfig, ResolvedModel } from '../config/types.ts'
 import type { CachePolicy } from '../core/cache.ts'
 import { cachingFetch } from './promptcache.ts'
 import { parallelToolsFetch } from './paralleltools.ts'
+import { timeoutFetch } from './timeout.ts'
 import { keyOf, openCodeAuthPaths, readAuth, readAuthFile } from './auth.ts'
 import { loadCatalog, toProviderConfig } from './catalog.ts'
 import { stateFiles } from '../util/paths.ts'
@@ -193,6 +194,13 @@ export async function createLanguageModel(
   const options: Record<string, unknown> = {
     name: providerId,
     ...(provider.options ?? {}),
+  }
+  // Innermost first: `timeoutFetch` is what actually performs the request when
+  // configured, and the wrappers below only rewrite `init.body`/reuse whatever
+  // is already in `options.fetch` and call through — order between them and
+  // this one does not matter, but they must wrap this, not the other way round.
+  if (typeof provider.timeout === 'number') {
+    options.fetch = timeoutFetch(provider.timeout)
   }
   // The `wire` style has to reach the request body, which no provider option
   // exposes — so the provider's own fetch is wrapped. See `promptcache.ts` for

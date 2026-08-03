@@ -41,6 +41,10 @@
             "properties": {},
             "additionalProperties": true
           },
+          "timeout": {
+            "type": "number",
+            "description": "Seconds of silence allowed between response chunks before giving up. Default 300."
+          },
           "models": {
             "type": "object",
             "properties": {},

@@ -55,6 +55,11 @@ const providerConfig = obj(
     name: str,
     env: { ...strings, description: 'Env var names checked for an API key, in order' },
     options: obj({}, { additionalProperties: true }),
+    timeout: {
+      ...num,
+      description:
+        'Seconds of silence allowed between response chunks before giving up. Default 300.',
+    },
     models: obj({}, { additionalProperties: modelConfig }),
   },
   { required: ['models'] },
